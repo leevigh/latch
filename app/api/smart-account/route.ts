@@ -12,23 +12,26 @@ import {
   Address,
 } from "@stellar/stellar-sdk";
 
-// Load configuration from environment variables
-const TESTNET_CONFIG = {
-  rpcUrl: process.env.NEXT_PUBLIC_RPC_URL || "https://soroban-testnet.stellar.org",
-  networkPassphrase: process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE || Networks.TESTNET,
-  verifierAddress: process.env.NEXT_PUBLIC_VERIFIER_ADDRESS!,
-  counterAddress: process.env.NEXT_PUBLIC_COUNTER_ADDRESS!,
-  smartAccountWasmHash: process.env.NEXT_PUBLIC_SMART_ACCOUNT_WASM_HASH!,
-  bundlerSecret: process.env.BUNDLER_SECRET!,
+const getTestnetConfig = () => {
+  const config = {
+    rpcUrl: process.env.NEXT_PUBLIC_RPC_URL || "https://soroban-testnet.stellar.org",
+    networkPassphrase: process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE || Networks.TESTNET,
+    verifierAddress: process.env.NEXT_PUBLIC_VERIFIER_ADDRESS!,
+    counterAddress: process.env.NEXT_PUBLIC_COUNTER_ADDRESS!,
+    // Fallback to the known demo WASM hash if missing from .env
+    smartAccountWasmHash: process.env.NEXT_PUBLIC_SMART_ACCOUNT_WASM_HASH || "cf67f31cbff555b5a6c1fb3ab4411b9cdf34e96d4d2cf52dbec5d1f13fc6db40",
+    bundlerSecret: process.env.BUNDLER_SECRET!,
+  };
+  
+  if (!config.bundlerSecret) {
+    throw new Error("BUNDLER_SECRET environment variable is required");
+  }
+  if (!config.verifierAddress || !config.counterAddress || !config.smartAccountWasmHash) {
+    throw new Error("Missing required contract addresses in environment variables");
+  }
+  
+  return config;
 };
-
-// Validate required environment variables
-if (!TESTNET_CONFIG.bundlerSecret) {
-  throw new Error("BUNDLER_SECRET environment variable is required");
-}
-if (!TESTNET_CONFIG.verifierAddress || !TESTNET_CONFIG.counterAddress || !TESTNET_CONFIG.smartAccountWasmHash) {
-  throw new Error("Missing required contract addresses in environment variables");
-}
 
 // Simple in-memory cache to track deployed accounts
 // In production, use a database
@@ -77,6 +80,7 @@ async function fundAccountIfNeeded(gAddress: string): Promise<void> {
 
 export async function POST(request: NextRequest) {
   try {
+    const TESTNET_CONFIG = getTestnetConfig();
     const { publicKeyHex } = await request.json();
 
     if (!publicKeyHex || typeof publicKeyHex !== "string" || publicKeyHex.length !== 64) {

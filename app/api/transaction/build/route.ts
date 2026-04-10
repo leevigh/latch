@@ -10,24 +10,22 @@ import {
   Keypair,
 } from "@stellar/stellar-sdk";
 
-const TESTNET_CONFIG = {
+const getConfig = () => ({
   rpcUrl: process.env.NEXT_PUBLIC_RPC_URL || "https://soroban-testnet.stellar.org",
   networkPassphrase: process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE || Networks.TESTNET,
-  counterAddress: process.env.NEXT_PUBLIC_COUNTER_ADDRESS!,
-  bundlerSecret: process.env.BUNDLER_SECRET!,
-};
-
-// Validate required environment variables
-if (!TESTNET_CONFIG.bundlerSecret || !TESTNET_CONFIG.counterAddress) {
-  throw new Error("Missing required environment variables (BUNDLER_SECRET, NEXT_PUBLIC_COUNTER_ADDRESS)");
-}
-
-// Derive bundler address from secret
-const bundlerKeypair = Keypair.fromSecret(TESTNET_CONFIG.bundlerSecret);
-const bundlerAddress = bundlerKeypair.publicKey();
+  counterAddress: process.env.NEXT_PUBLIC_COUNTER_ADDRESS || "CBRCNPTZ7YPP5BCGF42QSUWPYZQW6OJDPNQ4HDEYO7VI5Z6AVWWNEZ2U",
+  bundlerSecret: process.env.BUNDLER_SECRET,
+});
 
 export async function POST(request: NextRequest) {
+  const TESTNET_CONFIG = getConfig();
+
+  if (!TESTNET_CONFIG.bundlerSecret) {
+    return NextResponse.json({ error: "BUNDLER_SECRET is not set." }, { status: 500 });
+  }
+
   try {
+    const bundlerKeypair = Keypair.fromSecret(TESTNET_CONFIG.bundlerSecret);
     const server = new rpc.Server(TESTNET_CONFIG.rpcUrl);
     const { smartAccountAddress } = await request.json();
 
@@ -39,7 +37,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Build the transaction using bundler account as source (pays fees, signs envelope)
-    const account = await server.getAccount(bundlerAddress);
+    const account = await server.getAccount(bundlerKeypair.publicKey());
     const contract = new Contract(TESTNET_CONFIG.counterAddress);
 
     const tx = new TransactionBuilder(account, {

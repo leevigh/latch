@@ -73,7 +73,7 @@ async function testFullFlow() {
   // ============================================================================
   log("STEP 2: Deploy Smart Account", "");
 
-  const salt = crypto.createHash("sha256").update(publicKeyHex + "v6").digest("hex");
+  const salt = crypto.createHash("sha256").update(publicKeyHex + "v7").digest("hex");
   console.log(`Salt: ${salt}`);
 
   // Deploy via CLI (simpler than building deploy transaction)
@@ -289,6 +289,17 @@ async function testFullFlow() {
     }),
   ]);
 
+  const authPayloadMap = xdr.ScVal.scvMap([
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol("context_rule_ids"),
+      val: xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]),
+    }),
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol("signers"),
+      val: sigInnerMap,
+    }),
+  ]);
+
   console.log("Signature Map Structure:");
   console.log(`  Signer Type: External`);
   console.log(`  Verifier: ${VERIFIER_ADDRESS}`);
@@ -296,7 +307,7 @@ async function testFullFlow() {
 
   // Set signature on auth entry
   const credentials = parsedAuthEntry.credentials().address();
-  credentials.signature(xdr.ScVal.scvVec([sigInnerMap]));
+  credentials.signature(authPayloadMap);
 
   console.log("\n✅ Auth entry signed");
 

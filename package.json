@@ -58,6 +58,8 @@
     "input-otp": "1.4.1",
     "leva": "latest",
     "lucide-react": "^0.454.0",
+    "@stellar/freighter-api": "^2.0.0",
+    "@lobstrco/signer-extension-api": "^2.0.0",
     "maath": "latest",
     "next": "15.2.6",
     "next-themes": "latest",

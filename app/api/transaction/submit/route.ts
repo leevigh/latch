@@ -11,19 +11,23 @@ import {
   Account,
 } from "@stellar/stellar-sdk";
 
-const TESTNET_CONFIG = {
+const getConfig = () => ({
   rpcUrl: process.env.NEXT_PUBLIC_RPC_URL || "https://soroban-testnet.stellar.org",
   networkPassphrase: process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE || Networks.TESTNET,
-  verifierAddress: process.env.NEXT_PUBLIC_VERIFIER_ADDRESS!,
-  bundlerSecret: process.env.BUNDLER_SECRET!,
-};
-
-// Validate required environment variables
-if (!TESTNET_CONFIG.bundlerSecret || !TESTNET_CONFIG.verifierAddress) {
-  throw new Error("Missing required environment variables (BUNDLER_SECRET, NEXT_PUBLIC_VERIFIER_ADDRESS)");
-}
+  verifierAddress: process.env.NEXT_PUBLIC_VERIFIER_ADDRESS,
+  bundlerSecret: process.env.BUNDLER_SECRET,
+});
 
 export async function POST(request: NextRequest) {
+  const TESTNET_CONFIG = getConfig();
+
+  if (!TESTNET_CONFIG.bundlerSecret) {
+    return NextResponse.json({ error: "BUNDLER_SECRET is not set in environment variables." }, { status: 500 });
+  }
+  if (!TESTNET_CONFIG.verifierAddress) {
+    return NextResponse.json({ error: "NEXT_PUBLIC_VERIFIER_ADDRESS is not set in environment variables." }, { status: 500 });
+  }
+
   try {
     const server = new rpc.Server(TESTNET_CONFIG.rpcUrl);
     const {
@@ -73,8 +77,13 @@ export async function POST(request: NextRequest) {
     // Wrap the XDR bytes in ScBytes (this is what the verifier receives as sig_data)
     const sigDataBytes = xdr.ScVal.scvBytes(sigDataXdr);
 
-    // Build the signature map for smart account auth
-    // Format: Map<Signer, Signature> where Signer = External(verifier_address, public_key_bytes)
+    // Build the AuthPayload named struct for the smart account auth.
+    // The stellar_accounts crate defines:
+    // pub struct AuthPayload {
+    //     pub context_rule_ids: Vec<u32>,
+    //     pub signers: Map<Signer, Bytes>,
+    // }
+    // As a named struct, it serializes to XDR as a Map with Symbol keys sorted alphabetically.
     const phantomPubkeyBytes = Buffer.from(publicKeyHex, "hex");
 
     const signerKey = xdr.ScVal.scvVec([
@@ -83,20 +92,29 @@ export async function POST(request: NextRequest) {
       xdr.ScVal.scvBytes(phantomPubkeyBytes),
     ]);
 
-    const sigInnerMap = xdr.ScVal.scvMap([
+    const authPayloadMap = xdr.ScVal.scvMap([
       new xdr.ScMapEntry({
-        key: signerKey,
-        val: sigDataBytes,  // XDR-encoded Ed25519SigData struct
+        key: xdr.ScVal.scvSymbol("context_rule_ids"),
+        val: xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]), // Maps auth_contexts[0] to rule ID 0 (the default rule created in constructor)
+      }),
+      new xdr.ScMapEntry({
+        key: xdr.ScVal.scvSymbol("signers"),
+        val: xdr.ScVal.scvMap([
+          new xdr.ScMapEntry({
+            key: signerKey,
+            val: sigDataBytes,  // XDR-encoded Ed25519SigData struct
+          }),
+        ]),
       }),
     ]);
 
     // Set the signature on the auth entry
     const credentials = authEntry.credentials().address();
-    credentials.signature(xdr.ScVal.scvVec([sigInnerMap]));
+    credentials.signature(authPayloadMap);
 
     // Build new transaction with signed auth entry
     const origOp = tx.operations[0] as Operation.InvokeHostFunction;
-    const sourceAccount = new Account(tx.source, (BigInt(tx.sequence) - 1n).toString());
+    const sourceAccount = new Account(tx.source, (BigInt(tx.sequence) - BigInt(1)).toString());
 
     const txWithAuth = new TransactionBuilder(sourceAccount, {
       fee: "100000",
@@ -143,7 +161,7 @@ export async function POST(request: NextRequest) {
     console.log(`\n✅ Transaction submitted: ${txHash}`);
     console.log(`   View on explorer: https://stellar.expert/explorer/testnet/tx/${txHash}`);
 
-    let txResult: rpc.Api.GetTransactionResponse;
+    let txResult: rpc.Api.GetTransactionResponse | undefined;
 
     for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 1000));
@@ -162,7 +180,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Get detailed error information
-    let errorDetail = txResult!.status;
+    let errorDetail: string = txResult!.status;
     if (txResult!.status === rpc.Api.GetTransactionStatus.FAILED) {
       const result = txResult as rpc.Api.GetFailedTransactionResponse;
 
@@ -212,7 +230,7 @@ export async function POST(request: NextRequest) {
 
         if (opResultCode === "opInner") {
           const innerResult = opResult.value();
-          const invokeResult = innerResult.switch().name;
+          const invokeResult = (innerResult as any).switch().name;
           console.error("Invoke result:", invokeResult);
 
           // If it's invokeHostFunctionTrapped, get the diagnostic events
