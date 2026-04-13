@@ -5,10 +5,13 @@ import {
   Networks,
   Address,
   xdr,
-  hash,
   rpc,
   Keypair,
+  Operation,
+  hash,
 } from "@stellar/stellar-sdk";
+import { assembleTransaction } from "@stellar/stellar-sdk/rpc";
+import { hashSorobanAuthPayload } from "@/lib/soroban-auth-payload";
 
 const getConfig = () => ({
   rpcUrl: process.env.NEXT_PUBLIC_RPC_URL || "https://soroban-testnet.stellar.org",
@@ -71,26 +74,32 @@ export async function POST(request: NextRequest) {
       ? xdr.SorobanAuthorizationEntry.fromXDR(authEntries[0], "base64")
       : authEntries[0] as xdr.SorobanAuthorizationEntry;
     const credentials = authEntry.credentials().address();
-    const nonce = credentials.nonce();
 
     // Set validity window - 60 ledgers (~5 minutes)
     const latestLedger = simResult.latestLedger;
     const validUntilLedger = latestLedger + 60;
     credentials.signatureExpirationLedger(validUntilLedger);
 
-    // Compute the payload hash
-    const networkIdHash = hash(Buffer.from(TESTNET_CONFIG.networkPassphrase));
-
-    const preimage = xdr.HashIdPreimage.envelopeTypeSorobanAuthorization(
-      new xdr.HashIdPreimageSorobanAuthorization({
-        networkId: networkIdHash,
-        nonce: nonce,
-        signatureExpirationLedger: validUntilLedger,
-        invocation: authEntry.rootInvocation(),
+    // Merge simulation footprint into tx (required for valid Soroban auth context)
+    const assembledBuilder = assembleTransaction(tx, simResult);
+    assembledBuilder.clearOperations();
+    const origOp = tx.operations[0] as Operation.InvokeHostFunction;
+    assembledBuilder.addOperation(
+      Operation.invokeHostFunction({
+        source: origOp.source,
+        func: origOp.func,
+        auth: [authEntry],
       })
     );
+    const assembledTx = assembledBuilder.build();
 
-    const payloadHash = hash(preimage.toXDR());
+    // signaturePayload is the Soroban auth payload hash (32 bytes).
+    const signaturePayload = hashSorobanAuthPayload(authEntry, TESTNET_CONFIG.networkPassphrase);
+    // External signers must sign authDigest = sha256(signaturePayload || context_rule_ids.to_xdr()).
+    // For a single context, the only rule id is 0.
+    const ruleIdsXdr = xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]).toXDR();
+    const authDigest = hash(Buffer.concat([signaturePayload, Buffer.from(ruleIdsXdr)]));
+    const authDigestHex = authDigest.toString("hex");
 
     // Handle transactionData - may be string, XDR object, or SorobanDataBuilder
     let transactionDataXdr: string | undefined;
@@ -108,14 +117,17 @@ export async function POST(request: NextRequest) {
     }
 
     return NextResponse.json({
-      txXdr: tx.toXDR(),
+      txXdr: assembledTx.toXDR(),
       authEntryXdr: authEntry.toXDR("base64"),
       simulationResultXdr: JSON.stringify({
         transactionData: transactionDataXdr,
         minResourceFee: simResult.minResourceFee,
         latestLedger: simResult.latestLedger,
       }),
-      authPayloadHash: payloadHash.toString("hex"),
+      // Client must sign: "Stellar Smart Account Auth:\n" + authDigestHex (lowercase hex)
+      authDigestHex,
+      // Keep for debugging/visibility; not what external signers should sign.
+      signaturePayloadHex: signaturePayload.toString("hex"),
       validUntilLedger,
     });
   } catch (error) {

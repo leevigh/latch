@@ -8,8 +8,11 @@ import {
   Transaction,
   Operation,
   Keypair,
-  Account,
+  scValToNative,
+  hash,
 } from "@stellar/stellar-sdk";
+import { hashSorobanAuthPayload } from "@/lib/soroban-auth-payload";
+import nacl from "tweetnacl";
 
 const getConfig = () => ({
   rpcUrl: process.env.NEXT_PUBLIC_RPC_URL || "https://soroban-testnet.stellar.org",
@@ -45,6 +48,33 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const EXPECTED_PREFIX = "Stellar Smart Account Auth:\n";
+    const EXPECTED_MSG_LEN = EXPECTED_PREFIX.length + 64; // prefix + lowercase hex of 32-byte hash
+    if (prefixedMessage.length !== EXPECTED_MSG_LEN || !prefixedMessage.startsWith(EXPECTED_PREFIX)) {
+      return NextResponse.json(
+        { error: `prefixedMessage must be ${EXPECTED_MSG_LEN} chars (${EXPECTED_PREFIX.slice(0, 20)}…+64 hex)` },
+        { status: 400 }
+      );
+    }
+    if (!/^[0-9a-f]{64}$/.test(prefixedMessage.slice(EXPECTED_PREFIX.length))) {
+      return NextResponse.json(
+        { error: "Auth hash in prefixedMessage must be 64 lowercase hex chars" },
+        { status: 400 }
+      );
+    }
+    if (!/^[0-9a-f]{128}$/.test(authSignatureHex)) {
+      return NextResponse.json(
+        { error: "authSignatureHex must be 128 hex chars (64-byte Ed25519 signature)" },
+        { status: 400 }
+      );
+    }
+    if (!/^[0-9a-f]{64}$/.test(publicKeyHex)) {
+      return NextResponse.json(
+        { error: "publicKeyHex must be 64 hex chars (32-byte Ed25519 public key)" },
+        { status: 400 }
+      );
+    }
+
     // Reconstruct objects from XDR
     const tx = TransactionBuilder.fromXDR(
       txXdr,
@@ -53,32 +83,39 @@ export async function POST(request: NextRequest) {
 
     const authEntry = xdr.SorobanAuthorizationEntry.fromXDR(authEntryXdr, "base64");
 
-    // Build the Ed25519SigData as an ScMap.
-    // Map keys must be sorted lexicographically (prefixed_message < signature ✓)
-    const prefixedMessageBytes = Buffer.from(prefixedMessage, "utf-8");
+    // Recompute authDigest = sha256(signaturePayload || context_rule_ids.to_xdr()).
+    const signaturePayload = hashSorobanAuthPayload(authEntry, TESTNET_CONFIG.networkPassphrase);
+    const ruleIdsXdr = xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]).toXDR();
+    const authDigestHex = hash(Buffer.concat([signaturePayload, Buffer.from(ruleIdsXdr)])).toString("hex");
+    const signedPayloadHex = prefixedMessage.slice(EXPECTED_PREFIX.length);
+    if (signedPayloadHex !== authDigestHex) {
+      return NextResponse.json(
+        {
+          error: `Signed auth hash does not match recomputed authDigest. signed=${signedPayloadHex} expected=${authDigestHex}`,
+        },
+        { status: 400 }
+      );
+    }
+
     const authSignatureBytes = Buffer.from(authSignatureHex, "hex");
-
-    const sigDataMap = xdr.ScVal.scvMap([
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol("prefixed_message"),
-        val: xdr.ScVal.scvBytes(prefixedMessageBytes),
-      }),
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol("signature"),
-        val: xdr.ScVal.scvBytes(authSignatureBytes),
-      }),
-    ]);
-
-    // Serialize the ScMap to raw XDR bytes, then wrap in ScBytes.
-    // The verifier receives a Bytes Val and calls from_xdr() on it —
-    // so it expects the raw XDR of the contracttype as the byte content.
-    const sigDataBytes = xdr.ScVal.scvBytes(sigDataMap.toXDR());
+    if (authSignatureBytes.length !== 64) {
+      return NextResponse.json(
+        { error: `authSignatureHex must decode to exactly 64 bytes (got ${authSignatureBytes.length})` },
+        { status: 400 }
+      );
+    }
 
     // Build the Signatures tuple struct for the smart account auth.
     // The stellar_accounts crate defines:
     // pub struct Signatures(pub Map<Signer, Bytes>);
     // As a tuple struct, it serializes to XDR as an ScVec of length 1.
     const phantomPubkeyBytes = Buffer.from(publicKeyHex, "hex");
+    if (phantomPubkeyBytes.length !== 32) {
+      return NextResponse.json(
+        { error: `publicKeyHex must decode to exactly 32 bytes (got ${phantomPubkeyBytes.length})` },
+        { status: 400 }
+      );
+    }
 
     const signerKey = xdr.ScVal.scvVec([
       xdr.ScVal.scvSymbol("External"),
@@ -99,7 +136,9 @@ export async function POST(request: NextRequest) {
         val: xdr.ScVal.scvMap([
           new xdr.ScMapEntry({
             key: signerKey,
-            val: sigDataBytes,
+            // Verifier interface: verify(hash: Bytes, key_data: BytesN<32>, sig_data: BytesN<64>).
+            // Soroban represents both Bytes and BytesN as ScVal.scvBytes; BytesN is enforced by length.
+            val: xdr.ScVal.scvBytes(authSignatureBytes),
           }),
         ]),
       }),
@@ -109,22 +148,99 @@ export async function POST(request: NextRequest) {
     const credentials = authEntry.credentials().address();
     credentials.signature(signaturesScVal);
 
-    // Build new transaction with signed auth entry
-    const origOp = tx.operations[0] as Operation.InvokeHostFunction;
-    const sourceAccount = new Account(tx.source, (BigInt(tx.sequence) - BigInt(1)).toString());
+    const env = tx.toEnvelope();
+    if (env.switch().name !== "envelopeTypeTx") {
+      return NextResponse.json({ error: "Expected a v1 transaction envelope" }, { status: 400 });
+    }
+    const txExt = env.v1().tx().ext();
+    if (txExt.switch() === 0) {
+      return NextResponse.json(
+        {
+          error:
+            "Transaction is missing Soroban resource data. Call /api/transaction/build again and submit the new txXdr.",
+        },
+        { status: 400 }
+      );
+    }
+    const sorobanData = txExt.value() as xdr.SorobanTransactionData;
 
-    const txWithAuth = new TransactionBuilder(sourceAccount, {
-      fee: "100000",
+    const origOp = tx.operations[0] as Operation.InvokeHostFunction;
+    const tb = TransactionBuilder.cloneFrom(tx, {
+      fee: tx.fee,
+      sorobanData,
       networkPassphrase: TESTNET_CONFIG.networkPassphrase,
-    })
-      .addOperation(
-        Operation.invokeHostFunction({
-          func: origOp.func,
-          auth: [authEntry],
-        })
-      )
-      .setTimeout(300)
-      .build();
+    });
+    tb.clearOperations();
+    tb.addOperation(
+      Operation.invokeHostFunction({
+        source: origOp.source,
+        func: origOp.func,
+        auth: [authEntry],
+      })
+    );
+    const txWithAuth = tb.build();
+
+    const extractVerifierHashHexFromDiagnostics = (diagnosticEventsXdr: unknown): string | undefined => {
+      const events = Array.isArray(diagnosticEventsXdr) ? diagnosticEventsXdr : [];
+
+      const toNative = (scv: xdr.ScVal): unknown => {
+        try {
+          return scValToNative(scv);
+        } catch {
+          // ignore
+        }
+        return undefined;
+      };
+
+      const bytes32HexFromNative = (native: unknown): string | undefined => {
+        if (native instanceof Uint8Array && native.length === 32) {
+          return Buffer.from(native).toString("hex");
+        }
+        if (Array.isArray(native)) {
+          // For a verifier call, data is usually [hash, key_data, sig_data]
+          for (const v of native) {
+            const h = bytes32HexFromNative(v);
+            if (h) return h;
+          }
+        }
+        if (native && typeof native === "object") {
+          // Maps/objects can contain nested arrays/bytes
+          for (const v of Object.values(native as Record<string, unknown>)) {
+            const h = bytes32HexFromNative(v);
+            if (h) return h;
+          }
+        }
+        return undefined;
+      };
+
+      for (const ev of events) {
+        try {
+          const parsed =
+            typeof ev === "string"
+              ? xdr.DiagnosticEvent.fromXDR(ev, "base64")
+              : (ev as xdr.DiagnosticEvent);
+          const contractEvent = parsed.event();
+          const body = contractEvent.body()?.v0?.();
+          if (!body) continue;
+
+          // Prefer the explicit fn_call event for the verifier's verify().
+          const topics = body.topics() ?? [];
+          const nativeTopics = topics.map((t) => toNative(t));
+          const sawFnCall = nativeTopics.includes("fn_call");
+          const sawVerify = nativeTopics.includes("verify");
+          const sawVerifierAddr = nativeTopics.includes(TESTNET_CONFIG.verifierAddress);
+
+          if (!(sawFnCall && sawVerify && sawVerifierAddr)) continue;
+
+          const dataNative = body.data() ? toNative(body.data()) : undefined;
+          const hashHex = bytes32HexFromNative(dataNative);
+          if (hashHex) return hashHex;
+        } catch {
+          // ignore parsing errors
+        }
+      }
+      return undefined;
+    };
 
     // Enforcing Mode simulation: validates the signature and gets accurate
     // footprint + resource fees. This replaces all manual footprint patching,
@@ -132,7 +248,35 @@ export async function POST(request: NextRequest) {
     const enforcingSim = await server.simulateTransaction(txWithAuth);
 
     if (rpc.Api.isSimulationError(enforcingSim)) {
-      throw new Error(`Auth validation failed: ${enforcingSim.error}`);
+      const verifierHashHex = extractVerifierHashHexFromDiagnostics((enforcingSim as any).diagnosticEventsXdr);
+      let localVerifyPrefixPlusHexUtf8: boolean | undefined;
+      let localVerifyPrefixPlusRawHash: boolean | undefined;
+      if (verifierHashHex) {
+        try {
+          const prefix = Buffer.from(EXPECTED_PREFIX, "utf-8");
+          const hashBytes = Buffer.from(verifierHashHex, "hex");
+          const sigBytes = authSignatureBytes;
+          const pkBytes = phantomPubkeyBytes;
+
+          const msgHexUtf8 = Buffer.from(EXPECTED_PREFIX + verifierHashHex, "utf-8");
+          const msgPrefixPlusRawHash = Buffer.concat([prefix, hashBytes]);
+
+          localVerifyPrefixPlusHexUtf8 = nacl.sign.detached.verify(msgHexUtf8, sigBytes, pkBytes);
+          localVerifyPrefixPlusRawHash = nacl.sign.detached.verify(msgPrefixPlusRawHash, sigBytes, pkBytes);
+        } catch {
+          // ignore
+        }
+      }
+      return NextResponse.json(
+        {
+          error: `Auth validation failed: ${enforcingSim.error}`,
+          verifierHashHex,
+          authDigestHex,
+          localVerifyPrefixPlusHexUtf8,
+          localVerifyPrefixPlusRawHash,
+        },
+        { status: 400 }
+      );
     }
 
     // assembleTransaction applies correct footprint + resource fees automatically

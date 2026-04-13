@@ -18,9 +18,7 @@ const AUTH_PREFIX     = "Stellar Smart Account Auth:\n";
 // ─── Wallet config ────────────────────────────────────────────────────────────
 
 const WALLETS: { type: WalletType; label: string; sub: string; accent: string }[] = [
-  { type: "phantom",   label: "Phantom",   sub: "Solana Wallet Standard",           accent: "indigo" },
-  { type: "freighter", label: "Freighter", sub: "Stellar Native Browser Extension", accent: "yellow" },
-  { type: "lobstr",    label: "Lobstr",    sub: "Stellar Lobstr Wallet Protocol",   accent: "blue"   },
+  { type: "phantom", label: "Phantom", sub: "Ed25519 wallet (only supported)", accent: "indigo" },
 ];
 
 const accentClasses: Record<string, string> = {
@@ -101,7 +99,7 @@ export default function SmartAccountsPage() {
     setTxHash(null);
 
     try {
-      // 3a. Build tx & get auth payload hash
+      // 3a. Build tx & get auth digest
       const buildRes = await fetch("/api/transaction/build", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -109,45 +107,74 @@ export default function SmartAccountsPage() {
       });
       const build = await buildRes.json();
       if (!buildRes.ok) throw new Error(build.error ?? "Build failed.");
-      const { txXdr, authEntryXdr, authPayloadHash } = build;
+      const { txXdr, authEntryXdr, authDigestHex } = build;
 
-      // 3b. Sign auth payload with wallet
-      setTxState("signing");
-      const prefixedMessage = AUTH_PREFIX + authPayloadHash;
-      const messageBytes    = new TextEncoder().encode(prefixedMessage);
-      let authSignatureHex: string;
+      const signPrefixedMessage = async (hashHex: string) => {
+        const normalizedHash = hashHex.toLowerCase();
+        const prefixedMessage = AUTH_PREFIX + normalizedHash;
+        const messageBytes = new TextEncoder().encode(prefixedMessage);
+        let authSignatureHex: string;
 
-      if (wallet.walletType === "phantom") {
+        if (wallet.walletType !== "phantom") {
+          throw new Error("Only Phantom wallet is supported for smart account auth.");
+        }
+
         const provider = (window as any).phantom?.solana;
         if (!provider) throw new Error("Phantom not found.");
-        const result = await provider.signMessage(messageBytes);
+        const result = await provider.signMessage(messageBytes, "utf8");
         authSignatureHex = Buffer.from(result.signature).toString("hex");
-      } else if (wallet.walletType === "freighter") {
-        // Freighter v2 replaced signMessage with signBlob (base64 → base64 string)
-        const { signBlob } = await import("@stellar/freighter-api");
-        const signedBlob = await signBlob(Buffer.from(messageBytes).toString("base64"));
-        authSignatureHex = Buffer.from(signedBlob as string, "base64").toString("hex");
-      } else {
-        const { signMessage } = await import("@lobstrco/signer-extension-api");
-        const result = await (signMessage as any)(Buffer.from(messageBytes).toString("base64"));
-        authSignatureHex = Buffer.from(result, "base64").toString("hex");
+
+        return { prefixedMessage, authSignatureHex };
+      };
+
+      const submitOnce = async (authSignatureHex: string, prefixedMessage: string) => {
+        const submitRes = await fetch("/api/transaction/submit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            txXdr,
+            authEntryXdr,
+            authSignatureHex,
+            prefixedMessage,
+            publicKeyHex: wallet.publicKeyHex,
+          }),
+        });
+        const submitData = await submitRes.json();
+        return { submitRes, submitData };
+      };
+
+      // 3b. Sign + submit (retry once with verifier hash if provided)
+      setTxState("signing");
+      const first = await signPrefixedMessage(authDigestHex);
+
+      setTxState("submitting");
+      let { submitRes, submitData } = await submitOnce(first.authSignatureHex, first.prefixedMessage);
+
+      if (!submitRes.ok && submitData?.verifierHashHex && typeof submitData.verifierHashHex === "string") {
+        setTxState("signing");
+        const second = await signPrefixedMessage(submitData.verifierHashHex);
+        setTxState("submitting");
+        ({ submitRes, submitData } = await submitOnce(second.authSignatureHex, second.prefixedMessage));
       }
 
-      // 3c. Submit
-      setTxState("submitting");
-      const submitRes = await fetch("/api/transaction/submit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ txXdr, authEntryXdr, authSignatureHex, prefixedMessage, publicKeyHex: wallet.publicKeyHex }),
-      });
-      const submitData = await submitRes.json();
-      if (!submitRes.ok) throw new Error(submitData.error ?? "Submit failed.");
+      if (!submitRes.ok) {
+        const parts: string[] = [submitData?.error ?? "Submit failed."];
+        if (submitData?.verifierHashHex) parts.push(`verifierHashHex: ${submitData.verifierHashHex}`);
+        if (typeof submitData?.localVerifyPrefixPlusHexUtf8 === "boolean") {
+          parts.push(`localVerifyPrefixPlusHexUtf8: ${submitData.localVerifyPrefixPlusHexUtf8}`);
+        }
+        if (typeof submitData?.localVerifyPrefixPlusRawHash === "boolean") {
+          parts.push(`localVerifyPrefixPlusRawHash: ${submitData.localVerifyPrefixPlusRawHash}`);
+        }
+        throw new Error(parts.join("\n"));
+      }
 
       setTxHash(submitData.hash);
       setTxState("success");
       await fetchCounter();
     } catch (err: any) {
-      setTxError(err.message ?? "Transaction failed.");
+      const msg = err?.message ?? "Transaction failed.";
+      setTxError(msg);
       setTxState("error");
     }
   }, [wallet, smartAccountAddr]);
