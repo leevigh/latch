@@ -20,6 +20,19 @@ const getConfig = () => ({
   bundlerSecret: process.env.BUNDLER_SECRET,
 });
 
+async function fundAccountIfNeeded(gAddress: string): Promise<void> {
+  try {
+    const horizonResponse = await fetch(`https://horizon-testnet.stellar.org/accounts/${gAddress}`);
+    if (horizonResponse.ok) return;
+  } catch {
+    // ignore
+  }
+  const response = await fetch(`https://friendbot.stellar.org?addr=${encodeURIComponent(gAddress)}`);
+  if (!response.ok) {
+    throw new Error(`Failed to fund account: ${response.statusText}`);
+  }
+}
+
 export async function POST(request: NextRequest) {
   const TESTNET_CONFIG = getConfig();
 
@@ -40,7 +53,18 @@ export async function POST(request: NextRequest) {
     }
 
     // Build the transaction using bundler account as source (pays fees, signs envelope)
-    const account = await server.getAccount(bundlerKeypair.publicKey());
+    let account;
+    try {
+      account = await server.getAccount(bundlerKeypair.publicKey());
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (msg.includes("Account not found")) {
+        await fundAccountIfNeeded(bundlerKeypair.publicKey());
+        account = await server.getAccount(bundlerKeypair.publicKey());
+      } else {
+        throw e;
+      }
+    }
     const contract = new Contract(TESTNET_CONFIG.counterAddress);
 
     const tx = new TransactionBuilder(account, {

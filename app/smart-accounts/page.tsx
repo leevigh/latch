@@ -6,6 +6,7 @@ import {
   Loader2, ExternalLink, Activity, CheckCircle,
   AlertTriangle, Zap, Hash, ArrowRight,
 } from "lucide-react";
+import { signBlob } from "@stellar/freighter-api";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -19,6 +20,7 @@ const AUTH_PREFIX     = "Stellar Smart Account Auth:\n";
 
 const WALLETS: { type: WalletType; label: string; sub: string; accent: string }[] = [
   { type: "phantom", label: "Phantom", sub: "Ed25519 wallet (only supported)", accent: "indigo" },
+  { type: "freighter", label: "Freighter", sub: "Stellar wallet (native signing flow)", accent: "yellow" },
 ];
 
 const accentClasses: Record<string, string> = {
@@ -56,7 +58,10 @@ export default function SmartAccountsPage() {
     try {
       const info = await connectWallet(type);
       setWallet(info);
-      const res  = await fetch(`/api/smart-account/factory?pubkey=${info.publicKeyHex}`);
+      const res =
+        type === "freighter"
+          ? await fetch(`/api/smart-account/freighter?gAddress=${encodeURIComponent(info.gAddress ?? "")}`)
+          : await fetch(`/api/smart-account/factory?pubkey=${info.publicKeyHex}`);
       const data = await res.json();
       if (data.deployed && data.smartAccountAddress) {
         setSmartAccountAddr(data.smartAccountAddress);
@@ -76,10 +81,15 @@ export default function SmartAccountsPage() {
     setSetupState("deploying");
     setSetupError(null);
     try {
-      const res  = await fetch("/api/smart-account/factory", {
+      const deployUrl = wallet.walletType === "freighter" ? "/api/smart-account/freighter" : "/api/smart-account/factory";
+
+      const res  = await fetch(deployUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ publicKeyHex: wallet.publicKeyHex }),
+        body:
+          wallet.walletType === "freighter"
+            ? JSON.stringify({ gAddress: wallet.gAddress })
+            : JSON.stringify({ publicKeyHex: wallet.publicKeyHex }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "Failed to deploy smart account.");
@@ -99,7 +109,7 @@ export default function SmartAccountsPage() {
     setTxHash(null);
 
     try {
-      // 3a. Build tx & get auth digest
+      // 3a. Build tx & get auth digest (same path for Phantom + Freighter: external Ed25519 smart account)
       const buildRes = await fetch("/api/transaction/build", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -112,19 +122,29 @@ export default function SmartAccountsPage() {
       const signPrefixedMessage = async (hashHex: string) => {
         const normalizedHash = hashHex.toLowerCase();
         const prefixedMessage = AUTH_PREFIX + normalizedHash;
-        const messageBytes = new TextEncoder().encode(prefixedMessage);
-        let authSignatureHex: string;
 
-        if (wallet.walletType !== "phantom") {
-          throw new Error("Only Phantom wallet is supported for smart account auth.");
+        if (wallet.walletType === "phantom") {
+          const messageBytes = new TextEncoder().encode(prefixedMessage);
+          const provider = (window as any).phantom?.solana;
+          if (!provider) throw new Error("Phantom not found.");
+          const result = await provider.signMessage(messageBytes, "utf8");
+          const authSignatureHex = Buffer.from(result.signature).toString("hex");
+          return { prefixedMessage, authSignatureHex };
         }
 
-        const provider = (window as any).phantom?.solana;
-        if (!provider) throw new Error("Phantom not found.");
-        const result = await provider.signMessage(messageBytes, "utf8");
-        authSignatureHex = Buffer.from(result.signature).toString("hex");
+        if (wallet.walletType === "freighter") {
+          const signerG = wallet.gAddress;
+          if (!signerG) throw new Error("Missing Freighter public key (G-address). Reconnect wallet.");
+          const payloadB64 = Buffer.from(prefixedMessage, "utf8").toString("base64");
+          const sigB64 = await signBlob(payloadB64, { accountToSign: signerG });
+          const sigBytes = Buffer.from(sigB64, "base64");
+          if (sigBytes.length !== 64) {
+            throw new Error(`Freighter signBlob must return a 64-byte Ed25519 signature (got ${sigBytes.length}).`);
+          }
+          return { prefixedMessage, authSignatureHex: sigBytes.toString("hex") };
+        }
 
-        return { prefixedMessage, authSignatureHex };
+        throw new Error(`Unsupported wallet type for signing: ${wallet.walletType}`);
       };
 
       const submitOnce = async (authSignatureHex: string, prefixedMessage: string) => {

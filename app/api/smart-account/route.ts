@@ -317,6 +317,7 @@ export async function POST(request: NextRequest) {
 }
 
 export async function GET() {
+  const TESTNET_CONFIG = getTestnetConfig();
   return NextResponse.json({
     verifierAddress: TESTNET_CONFIG.verifierAddress,
     counterAddress: TESTNET_CONFIG.counterAddress,
