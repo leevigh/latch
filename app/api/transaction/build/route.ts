@@ -5,29 +5,30 @@ import {
   Networks,
   Address,
   xdr,
-  hash,
   rpc,
   Keypair,
+  Operation,
+  hash,
 } from "@stellar/stellar-sdk";
+import { assembleTransaction } from "@stellar/stellar-sdk/rpc";
+import { hashSorobanAuthPayload } from "@/lib/soroban-auth-payload";
 
-const TESTNET_CONFIG = {
+const getConfig = () => ({
   rpcUrl: process.env.NEXT_PUBLIC_RPC_URL || "https://soroban-testnet.stellar.org",
   networkPassphrase: process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE || Networks.TESTNET,
-  counterAddress: process.env.NEXT_PUBLIC_COUNTER_ADDRESS!,
-  bundlerSecret: process.env.BUNDLER_SECRET!,
-};
-
-// Validate required environment variables
-if (!TESTNET_CONFIG.bundlerSecret || !TESTNET_CONFIG.counterAddress) {
-  throw new Error("Missing required environment variables (BUNDLER_SECRET, NEXT_PUBLIC_COUNTER_ADDRESS)");
-}
-
-// Derive bundler address from secret
-const bundlerKeypair = Keypair.fromSecret(TESTNET_CONFIG.bundlerSecret);
-const bundlerAddress = bundlerKeypair.publicKey();
+  counterAddress: process.env.NEXT_PUBLIC_COUNTER_ADDRESS || "CBRCNPTZ7YPP5BCGF42QSUWPYZQW6OJDPNQ4HDEYO7VI5Z6AVWWNEZ2U",
+  bundlerSecret: process.env.BUNDLER_SECRET,
+});
 
 export async function POST(request: NextRequest) {
+  const TESTNET_CONFIG = getConfig();
+
+  if (!TESTNET_CONFIG.bundlerSecret) {
+    return NextResponse.json({ error: "BUNDLER_SECRET is not set." }, { status: 500 });
+  }
+
   try {
+    const bundlerKeypair = Keypair.fromSecret(TESTNET_CONFIG.bundlerSecret);
     const server = new rpc.Server(TESTNET_CONFIG.rpcUrl);
     const { smartAccountAddress } = await request.json();
 
@@ -39,7 +40,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Build the transaction using bundler account as source (pays fees, signs envelope)
-    const account = await server.getAccount(bundlerAddress);
+    const account = await server.getAccount(bundlerKeypair.publicKey());
     const contract = new Contract(TESTNET_CONFIG.counterAddress);
 
     const tx = new TransactionBuilder(account, {
@@ -73,26 +74,32 @@ export async function POST(request: NextRequest) {
       ? xdr.SorobanAuthorizationEntry.fromXDR(authEntries[0], "base64")
       : authEntries[0] as xdr.SorobanAuthorizationEntry;
     const credentials = authEntry.credentials().address();
-    const nonce = credentials.nonce();
 
     // Set validity window - 60 ledgers (~5 minutes)
     const latestLedger = simResult.latestLedger;
     const validUntilLedger = latestLedger + 60;
     credentials.signatureExpirationLedger(validUntilLedger);
 
-    // Compute the payload hash
-    const networkIdHash = hash(Buffer.from(TESTNET_CONFIG.networkPassphrase));
-
-    const preimage = xdr.HashIdPreimage.envelopeTypeSorobanAuthorization(
-      new xdr.HashIdPreimageSorobanAuthorization({
-        networkId: networkIdHash,
-        nonce: nonce,
-        signatureExpirationLedger: validUntilLedger,
-        invocation: authEntry.rootInvocation(),
+    // Merge simulation footprint into tx (required for valid Soroban auth context)
+    const assembledBuilder = assembleTransaction(tx, simResult);
+    assembledBuilder.clearOperations();
+    const origOp = tx.operations[0] as Operation.InvokeHostFunction;
+    assembledBuilder.addOperation(
+      Operation.invokeHostFunction({
+        source: origOp.source,
+        func: origOp.func,
+        auth: [authEntry],
       })
     );
+    const assembledTx = assembledBuilder.build();
 
-    const payloadHash = hash(preimage.toXDR());
+    // signaturePayload is the Soroban auth payload hash (32 bytes).
+    const signaturePayload = hashSorobanAuthPayload(authEntry, TESTNET_CONFIG.networkPassphrase);
+    // External signers must sign authDigest = sha256(signaturePayload || context_rule_ids.to_xdr()).
+    // For a single context, the only rule id is 0.
+    const ruleIdsXdr = xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]).toXDR();
+    const authDigest = hash(Buffer.concat([signaturePayload, Buffer.from(ruleIdsXdr)]));
+    const authDigestHex = authDigest.toString("hex");
 
     // Handle transactionData - may be string, XDR object, or SorobanDataBuilder
     let transactionDataXdr: string | undefined;
@@ -110,14 +117,17 @@ export async function POST(request: NextRequest) {
     }
 
     return NextResponse.json({
-      txXdr: tx.toXDR(),
+      txXdr: assembledTx.toXDR(),
       authEntryXdr: authEntry.toXDR("base64"),
       simulationResultXdr: JSON.stringify({
         transactionData: transactionDataXdr,
         minResourceFee: simResult.minResourceFee,
         latestLedger: simResult.latestLedger,
       }),
-      authPayloadHash: payloadHash.toString("hex"),
+      // Client must sign: "Stellar Smart Account Auth:\n" + authDigestHex (lowercase hex)
+      authDigestHex,
+      // Keep for debugging/visibility; not what external signers should sign.
+      signaturePayloadHex: signaturePayload.toString("hex"),
       validUntilLedger,
     });
   } catch (error) {

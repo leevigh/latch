@@ -73,7 +73,7 @@ async function testFullFlow() {
   // ============================================================================
   log("STEP 2: Deploy Smart Account", "");
 
-  const salt = crypto.createHash("sha256").update(publicKeyHex + "v6").digest("hex");
+  const salt = crypto.createHash("sha256").update(publicKeyHex + "v7").digest("hex");
   console.log(`Salt: ${salt}`);
 
   // Deploy via CLI (simpler than building deploy transaction)
@@ -203,9 +203,9 @@ async function testFullFlow() {
   console.log("\nAuth Entry extracted successfully");
 
   // ============================================================================
-  // STEP 5: Generate auth payload hash and sign it
+  // STEP 5: Generate authDigest and sign it
   // ============================================================================
-  log("STEP 5: Generate Auth Payload & Sign", "");
+  log("STEP 5: Generate Auth Digest & Sign", "");
 
   // Set a proper signature expiration ledger (~5 minutes from now)
   // Recording Mode returns signatureExpirationLedger = 0 by default
@@ -224,14 +224,25 @@ async function testFullFlow() {
     })
   );
 
-  const authPayloadHash = crypto.createHash("sha256").update(hashEntry.toXDR()).digest();
-  const authPayloadHashHex = bytesToHex(authPayloadHash);
+  const signaturePayload = crypto.createHash("sha256").update(hashEntry.toXDR()).digest();
+  const signaturePayloadHex = bytesToHex(signaturePayload);
 
-  console.log(`Auth Payload Hash (hex): ${authPayloadHashHex}`);
-  console.log(`Auth Payload Hash (bytes): ${authPayloadHash.length} bytes`);
+  // External signers must sign:
+  // authDigest = sha256(signaturePayload || context_rule_ids.to_xdr()).
+  const ruleIdsXdr = xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]).toXDR();
+  const authDigest = crypto
+    .createHash("sha256")
+    .update(Buffer.concat([signaturePayload, Buffer.from(ruleIdsXdr)]))
+    .digest();
+  const authDigestHex = bytesToHex(authDigest);
+
+  console.log(`Signature Payload (hex): ${signaturePayloadHex}`);
+  console.log(`Signature Payload (bytes): ${signaturePayload.length} bytes`);
+  console.log(`Auth Digest (hex): ${authDigestHex}`);
+  console.log(`Auth Digest (bytes): ${authDigest.length} bytes`);
 
   // Construct prefixed message (what Phantom signs)
-  const prefixedMessage = AUTH_PREFIX + authPayloadHashHex;
+  const prefixedMessage = AUTH_PREFIX + authDigestHex;
   const prefixedMessageBytes = Buffer.from(prefixedMessage, "utf-8");
 
   console.log(`\nPrefixed Message: "${prefixedMessage}"`);
@@ -289,6 +300,17 @@ async function testFullFlow() {
     }),
   ]);
 
+  const authPayloadMap = xdr.ScVal.scvMap([
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol("context_rule_ids"),
+      val: xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]),
+    }),
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol("signers"),
+      val: sigInnerMap,
+    }),
+  ]);
+
   console.log("Signature Map Structure:");
   console.log(`  Signer Type: External`);
   console.log(`  Verifier: ${VERIFIER_ADDRESS}`);
@@ -296,7 +318,7 @@ async function testFullFlow() {
 
   // Set signature on auth entry
   const credentials = parsedAuthEntry.credentials().address();
-  credentials.signature(xdr.ScVal.scvVec([sigInnerMap]));
+  credentials.signature(authPayloadMap);
 
   console.log("\n✅ Auth entry signed");
 

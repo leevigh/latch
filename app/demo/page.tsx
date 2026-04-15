@@ -137,10 +137,10 @@ export default function DemoPage() {
         throw new Error(errorData.error || "Failed to build transaction");
       }
 
-      const { txXdr, authEntryXdr, authPayloadHash, validUntilLedger } =
+      const { txXdr, authEntryXdr, authDigestHex, validUntilLedger } =
         await buildResponse.json();
 
-      console.log("Auth payload hash:", authPayloadHash);
+      console.log("Auth digest hex:", authDigestHex);
       console.log("Valid until ledger:", validUntilLedger);
 
       // Step 2: Sign auth payload with Phantom (using direct provider)
@@ -159,9 +159,10 @@ export default function DemoPage() {
 
       // Sign the auth payload hash (for smart account authorization)
       console.log("Signing auth payload...");
-      const prefixedMessage = AUTH_PREFIX + authPayloadHash;
+      const prefixedMessage = AUTH_PREFIX + String(authDigestHex).toLowerCase();
       const authMessage = new TextEncoder().encode(prefixedMessage);
-      const authSignResult = await provider.signMessage(authMessage);
+      // Phantom requires the display encoding; omitting it can change what gets signed vs shown.
+      const authSignResult = await provider.signMessage(authMessage, "utf8");
 
       console.log("Auth signature result:", authSignResult);
       const authSignatureHex = Buffer.from(authSignResult.signature).toString("hex");

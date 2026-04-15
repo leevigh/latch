@@ -148,7 +148,7 @@ console.log("=".repeat(80));
 const parsedAuthEntry = xdr.SorobanAuthorizationEntry.fromXDR(authEntry.toXDR("base64"), "base64");
 const rootInvocation = parsedAuthEntry.rootInvocation();
 
-// Build auth payload hash (what gets signed)
+// Build signaturePayload (Soroban auth payload hash)
 const hashEntry = xdr.HashIdPreimage.envelopeTypeSorobanAuthorization(
   new xdr.HashIdPreimageSorobanAuthorization({
     networkId: xdr.Hash.fromXDR(crypto.createHash("sha256").update(NETWORK_PASSPHRASE).digest()),
@@ -158,13 +158,23 @@ const hashEntry = xdr.HashIdPreimage.envelopeTypeSorobanAuthorization(
   })
 );
 
-const authPayloadHash = crypto.createHash("sha256").update(hashEntry.toXDR()).digest();
-const authPayloadHashHex = bytesToHex(authPayloadHash);
+const signaturePayload = crypto.createHash("sha256").update(hashEntry.toXDR()).digest();
+const signaturePayloadHex = bytesToHex(signaturePayload);
 
-console.log(`\nAuth Payload Hash: ${authPayloadHashHex}`);
+// External signers must sign:
+// authDigest = sha256(signaturePayload || context_rule_ids.to_xdr()).
+const ruleIdsXdr = xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]).toXDR();
+const authDigest = crypto
+  .createHash("sha256")
+  .update(Buffer.concat([signaturePayload, Buffer.from(ruleIdsXdr)]))
+  .digest();
+const authDigestHex = bytesToHex(authDigest);
+
+console.log(`\nSignature Payload: ${signaturePayloadHex}`);
+console.log(`Auth Digest: ${authDigestHex}`);
 
 // Construct prefixed message and sign (Phantom wallet would do this)
-const prefixedMessage = AUTH_PREFIX + authPayloadHashHex;
+const prefixedMessage = AUTH_PREFIX + authDigestHex;
 const prefixedMessageBytes = Buffer.from(prefixedMessage, "utf-8");
 const signature = nacl.sign.detached(prefixedMessageBytes, clientKeypair.secretKey);
 

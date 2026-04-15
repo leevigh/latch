@@ -55,6 +55,13 @@ export const MobileMenu = ({ className }: MobileMenuProps) => {
           </Dialog.Close>
           <nav className="flex flex-col space-y-6 container mx-auto">
                <Link
+                href="/smart-accounts"
+                onClick={() => setIsOpen(false)}
+                 className="text-xl font-mono uppercase text-foreground/60 transition-colors ease-out duration-150 hover:text-foreground/100 py-2"
+              >
+                Smart Accounts
+              </Link>
+               <Link
                 href="https://www.notion.so/Latch-C-Address-Onboarding-Infrastructure-3096bfb65b0f80cca03ef84ed890b599?source=copy_link"
                 target="_blank"
                 onClick={() => setIsOpen(false)}
