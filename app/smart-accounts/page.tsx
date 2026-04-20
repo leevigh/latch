@@ -3,42 +3,61 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { connectWallet, WalletType, WalletConnectionResult } from "@/lib/wallets";
 import {
+  registerPasskey, signWithPasskey, computeAuthDigest,
+  encodeWebAuthnSigData, type PasskeyRegistration,
+} from "@/lib/webauthn";
+import { signAuthEntry } from "@stellar/freighter-api";
+import { xdr, Networks } from "@stellar/stellar-sdk";
+import {
   Loader2, ExternalLink, Activity, CheckCircle,
-  AlertTriangle, Zap, Hash, ArrowRight,
+  AlertTriangle, Zap, Hash, ArrowRight, Fingerprint,
 } from "lucide-react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type SetupState = "idle" | "connecting" | "connected" | "deploying" | "ready" | "error";
-type TxState    = "idle" | "building"   | "signing"   | "submitting" | "success" | "error";
+type PasskeyState = "idle" | "registering" | "deploying" | "ready" | "error";
+type TxState = "idle" | "building" | "signing" | "submitting" | "success" | "error";
+type ActiveMode = "wallet" | "passkey" | null;
 
-const COUNTER_ADDRESS = "CBRCNPTZ7YPP5BCGF42QSUWPYZQW6OJDPNQ4HDEYO7VI5Z6AVWWNEZ2U";
-const AUTH_PREFIX     = "Stellar Smart Account Auth:\n";
+const COUNTER_ADDRESS =
+  process.env.NEXT_PUBLIC_COUNTER_ADDRESS ||
+  "CBRCNPTZ7YPP5BCGF42QSUWPYZQW6OJDPNQ4HDEYO7VI5Z6AVWWNEZ2U";
+const AUTH_PREFIX = "Stellar Smart Account Auth:\n";
+const NETWORK_PASSPHRASE = Networks.TESTNET;
 
 // ─── Wallet config ────────────────────────────────────────────────────────────
 
-const WALLETS: { type: WalletType; label: string; sub: string; accent: string }[] = [
-  { type: "phantom", label: "Phantom", sub: "Ed25519 wallet (only supported)", accent: "indigo" },
+const SOLANA_WALLETS: { type: WalletType; label: string; sub: string }[] = [
+  { type: "phantom", label: "Phantom", sub: "External Ed25519 signer" },
 ];
 
-const accentClasses: Record<string, string> = {
-  indigo: "bg-indigo-500/10 text-indigo-500",
-  yellow: "bg-yellow-500/10 text-yellow-500",
-  blue:   "bg-blue-500/10  text-blue-500",
-};
+const STELLAR_WALLETS: { type: WalletType; label: string; sub: string }[] = [
+  { type: "freighter", label: "Freighter", sub: "Delegated signer" },
+];
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function SmartAccountsPage() {
-  const [setupState,      setSetupState]      = useState<SetupState>("idle");
-  const [wallet,          setWallet]          = useState<WalletConnectionResult | null>(null);
-  const [smartAccountAddr,setSmartAccountAddr]= useState<string | null>(null);
-  const [setupError,      setSetupError]      = useState<string | null>(null);
+  // Wallet (Phantom / Freighter) state
+  const [setupState,       setSetupState]       = useState<SetupState>("idle");
+  const [wallet,           setWallet]           = useState<WalletConnectionResult | null>(null);
+  const [setupError,       setSetupError]       = useState<string | null>(null);
 
-  const [txState,     setTxState]     = useState<TxState>("idle");
-  const [counterValue,setCounterValue]= useState<number | null>(null);
-  const [txHash,      setTxHash]      = useState<string | null>(null);
-  const [txError,     setTxError]     = useState<string | null>(null);
+  // Passkey (WebAuthn) state
+  const [passkeyState,     setPasskeyState]     = useState<PasskeyState>("idle");
+  const [passkey,          setPasskey]          = useState<PasskeyRegistration | null>(null);
+  const [passkeyError,     setPasskeyError]     = useState<string | null>(null);
+
+  // Shared
+  const [activeMode,       setActiveMode]       = useState<ActiveMode>(null);
+  const [smartAccountAddr, setSmartAccountAddr] = useState<string | null>(null);
+
+  // Transaction state
+  const [txState,      setTxState]      = useState<TxState>("idle");
+  const [counterValue, setCounterValue] = useState<number | null>(null);
+  const [txHash,       setTxHash]       = useState<string | null>(null);
+  const [txError,      setTxError]      = useState<string | null>(null);
 
   useEffect(() => { fetchCounter(); }, []);
 
@@ -49,14 +68,25 @@ export default function SmartAccountsPage() {
     } catch { /* silent */ }
   };
 
-  // ── Step 1: Connect + auto-detect existing account ────────────────────────
+  // ── Wallet: Connect + auto-detect existing account ────────────────────────
   const handleConnect = async (type: WalletType) => {
     setSetupState("connecting");
     setSetupError(null);
+    setActiveMode("wallet");
+    // Clear passkey state when switching to wallet
+    setPasskeyState("idle");
+    setPasskey(null);
+    setPasskeyError(null);
+    setSmartAccountAddr(null);
     try {
       const info = await connectWallet(type);
       setWallet(info);
-      const res  = await fetch(`/api/smart-account/factory?pubkey=${info.publicKeyHex}`);
+
+      const lookupUrl = type === "freighter"
+        ? `/api/smart-account/freighter?gAddress=${info.gAddress}`
+        : `/api/smart-account/factory?pubkey=${info.publicKeyHex}`;
+
+      const res  = await fetch(lookupUrl);
       const data = await res.json();
       if (data.deployed && data.smartAccountAddress) {
         setSmartAccountAddr(data.smartAccountAddress);
@@ -70,16 +100,22 @@ export default function SmartAccountsPage() {
     }
   };
 
-  // ── Step 2: Create smart account via factory ──────────────────────────────
+  // ── Wallet: Create smart account via factory ──────────────────────────────
   const handleDeploy = async () => {
     if (!wallet) return;
     setSetupState("deploying");
     setSetupError(null);
     try {
-      const res  = await fetch("/api/smart-account/factory", {
+      const isFreighter = wallet.walletType === "freighter";
+      const endpoint = isFreighter ? "/api/smart-account/freighter" : "/api/smart-account/factory";
+      const body = isFreighter
+        ? { gAddress: wallet.gAddress }
+        : { publicKeyHex: wallet.publicKeyHex };
+
+      const res  = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ publicKeyHex: wallet.publicKeyHex }),
+        body: JSON.stringify(body),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "Failed to deploy smart account.");
@@ -91,112 +127,209 @@ export default function SmartAccountsPage() {
     }
   };
 
-  // ── Step 3: Increment counter via smart account ───────────────────────────
+  // ── Passkey: Register + deploy ────────────────────────────────────────────
+  const handlePasskeyRegister = async () => {
+    setPasskeyState("registering");
+    setPasskeyError(null);
+    setActiveMode("passkey");
+    // Clear wallet state when switching to passkey
+    setSetupState("idle");
+    setWallet(null);
+    setSetupError(null);
+    setSmartAccountAddr(null);
+    try {
+      const rpId = window.location.hostname;
+      const reg  = await registerPasskey(rpId, "Latch", "user");
+      setPasskey(reg);
+
+      setPasskeyState("deploying");
+      const res = await fetch("/api/smart-account/webauthn", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          keyDataHex:   reg.keyData.toString("hex"),
+          credentialId: reg.credentialId,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to deploy smart account");
+      setSmartAccountAddr(data.smartAccountAddress);
+      setPasskeyState("ready");
+    } catch (err: any) {
+      setPasskeyError(err.message ?? "Registration failed.");
+      setPasskeyState("error");
+    }
+  };
+
+  // ── Increment counter ─────────────────────────────────────────────────────
   const handleIncrement = useCallback(async () => {
-    if (!wallet || !smartAccountAddr) return;
+    if (!smartAccountAddr) return;
     setTxState("building");
     setTxError(null);
     setTxHash(null);
 
     try {
-      // 3a. Build tx & get auth digest
-      const buildRes = await fetch("/api/transaction/build", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ smartAccountAddress: smartAccountAddr }),
-      });
-      const build = await buildRes.json();
-      if (!buildRes.ok) throw new Error(build.error ?? "Build failed.");
-      const { txXdr, authEntryXdr, authDigestHex } = build;
+      if (activeMode === "passkey" && passkey) {
+        // ── Passkey (WebAuthn P-256) path ───────────────────────────────────
+        const buildRes = await fetch("/api/transaction/build", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ smartAccountAddress: smartAccountAddr }),
+        });
+        const build = await buildRes.json();
+        if (!buildRes.ok) throw new Error(build.error ?? "Build failed.");
+        const { txXdr, authEntryXdr, validUntilLedger } = build;
 
-      const signPrefixedMessage = async (hashHex: string) => {
-        const normalizedHash = hashHex.toLowerCase();
-        const prefixedMessage = AUTH_PREFIX + normalizedHash;
-        const messageBytes = new TextEncoder().encode(prefixedMessage);
-        let authSignatureHex: string;
+        const authEntry = xdr.SorobanAuthorizationEntry.fromXDR(authEntryXdr, "base64");
+        authEntry.credentials().address().signatureExpirationLedger(validUntilLedger);
+        const authDigest = computeAuthDigest(authEntry, NETWORK_PASSPHRASE, [0]);
 
-        if (wallet.walletType !== "phantom") {
-          throw new Error("Only Phantom wallet is supported for smart account auth.");
-        }
+        setTxState("signing");
+        const sig = await signWithPasskey(
+          passkey.credentialId,
+          authDigest,
+          window.location.hostname
+        );
+        const sigDataXdr = encodeWebAuthnSigData(sig);
 
-        const provider = (window as any).phantom?.solana;
-        if (!provider) throw new Error("Phantom not found.");
-        const result = await provider.signMessage(messageBytes, "utf8");
-        authSignatureHex = Buffer.from(result.signature).toString("hex");
-
-        return { prefixedMessage, authSignatureHex };
-      };
-
-      const submitOnce = async (authSignatureHex: string, prefixedMessage: string) => {
-        const submitRes = await fetch("/api/transaction/submit", {
+        setTxState("submitting");
+        const submitRes = await fetch("/api/transaction/submit-webauthn", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             txXdr,
             authEntryXdr,
-            authSignatureHex,
-            prefixedMessage,
-            publicKeyHex: wallet.publicKeyHex,
+            sigDataXdr:   sigDataXdr.toString("hex"),
+            keyDataHex:   passkey.keyData.toString("hex"),
+            contextRuleId: 0,
           }),
         });
         const submitData = await submitRes.json();
-        return { submitRes, submitData };
-      };
+        if (!submitRes.ok) throw new Error(submitData.error ?? "Submit failed.");
+        setTxHash(submitData.hash);
+        setTxState("success");
+        await fetchCounter();
 
-      // 3b. Sign + submit (retry once with verifier hash if provided)
-      setTxState("signing");
-      const first = await signPrefixedMessage(authDigestHex);
+      } else if (wallet?.walletType === "freighter") {
+        // ── Freighter (Delegated signer) path ──────────────────────────────
+        const buildRes = await fetch("/api/transaction/build-delegated", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ smartAccountAddress: smartAccountAddr, gAddress: wallet.gAddress }),
+        });
+        const build = await buildRes.json();
+        if (!buildRes.ok) throw new Error(build.error ?? "Build failed.");
+        const { txXdr, smartAccountAuthEntryXdr, gAddressPreimageXdr, gAddressEntryTemplateXdr } = build;
 
-      setTxState("submitting");
-      let { submitRes, submitData } = await submitOnce(first.authSignatureHex, first.prefixedMessage);
-
-      if (!submitRes.ok && submitData?.verifierHashHex && typeof submitData.verifierHashHex === "string") {
         setTxState("signing");
-        const second = await signPrefixedMessage(submitData.verifierHashHex);
+        // Freighter expects a HashIdPreimage, signs hash(preimage_bytes), returns raw 64-byte sig as base64
+        const signResult = await signAuthEntry(gAddressPreimageXdr, {
+          networkPassphrase: NETWORK_PASSPHRASE,
+        });
+        if (signResult.error) throw new Error(signResult.error.message || "Freighter signing failed");
+        if (!signResult.signedAuthEntry) throw new Error("Freighter returned no signed auth entry");
+
         setTxState("submitting");
-        ({ submitRes, submitData } = await submitOnce(second.authSignatureHex, second.prefixedMessage));
-      }
+        const submitRes = await fetch("/api/transaction/submit-delegated", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            txXdr,
+            smartAccountAuthEntryXdr,
+            gAddressEntryTemplateXdr,
+            signedAuthEntryBase64: signResult.signedAuthEntry, // raw 64-byte Ed25519 sig, base64
+            signerAddress: signResult.signerAddress,
+          }),
+        });
+        const submitData = await submitRes.json();
+        if (!submitRes.ok) throw new Error(submitData.error ?? "Submit failed.");
+        setTxHash(submitData.hash);
+        setTxState("success");
+        await fetchCounter();
 
-      if (!submitRes.ok) {
-        const parts: string[] = [submitData?.error ?? "Submit failed."];
-        if (submitData?.verifierHashHex) parts.push(`verifierHashHex: ${submitData.verifierHashHex}`);
-        if (typeof submitData?.localVerifyPrefixPlusHexUtf8 === "boolean") {
-          parts.push(`localVerifyPrefixPlusHexUtf8: ${submitData.localVerifyPrefixPlusHexUtf8}`);
-        }
-        if (typeof submitData?.localVerifyPrefixPlusRawHash === "boolean") {
-          parts.push(`localVerifyPrefixPlusRawHash: ${submitData.localVerifyPrefixPlusRawHash}`);
-        }
-        throw new Error(parts.join("\n"));
-      }
+      } else if (wallet) {
+        // ── Phantom (External Ed25519) path ─────────────────────────────────
+        const buildRes = await fetch("/api/transaction/build", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ smartAccountAddress: smartAccountAddr }),
+        });
+        const build = await buildRes.json();
+        if (!buildRes.ok) throw new Error(build.error ?? "Build failed.");
+        const { txXdr, authEntryXdr, authDigestHex } = build;
 
-      setTxHash(submitData.hash);
-      setTxState("success");
-      await fetchCounter();
+        const signPrefixed = async (hashHex: string) => {
+          const prefixedMessage = AUTH_PREFIX + hashHex.toLowerCase();
+          const messageBytes = new TextEncoder().encode(prefixedMessage);
+          const provider = (window as any).phantom?.solana;
+          if (!provider) throw new Error("Phantom not found.");
+          const result = await provider.signMessage(messageBytes, "utf8");
+          return { prefixedMessage, authSignatureHex: Buffer.from(result.signature).toString("hex") };
+        };
+
+        const submitOnce = async (authSignatureHex: string, prefixedMessage: string) => {
+          const submitRes = await fetch("/api/transaction/submit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ txXdr, authEntryXdr, authSignatureHex, prefixedMessage, publicKeyHex: wallet.publicKeyHex }),
+          });
+          return { submitRes, submitData: await submitRes.json() };
+        };
+
+        setTxState("signing");
+        const first = await signPrefixed(authDigestHex);
+        setTxState("submitting");
+        let { submitRes, submitData } = await submitOnce(first.authSignatureHex, first.prefixedMessage);
+
+        // Retry with verifier hash if digest mismatch (stale page)
+        if (!submitRes.ok && submitData?.verifierHashHex) {
+          setTxState("signing");
+          const second = await signPrefixed(submitData.verifierHashHex);
+          setTxState("submitting");
+          ({ submitRes, submitData } = await submitOnce(second.authSignatureHex, second.prefixedMessage));
+        }
+
+        if (!submitRes.ok) throw new Error(submitData?.error ?? "Submit failed.");
+        setTxHash(submitData.hash);
+        setTxState("success");
+        await fetchCounter();
+      }
     } catch (err: any) {
-      const msg = err?.message ?? "Transaction failed.";
-      setTxError(msg);
+      setTxError(err?.message ?? "Transaction failed.");
       setTxState("error");
     }
-  }, [wallet, smartAccountAddr]);
+  }, [wallet, passkey, smartAccountAddr, activeMode]);
 
   const reset = () => {
-    setSetupState("idle"); setWallet(null); setSmartAccountAddr(null);
-    setSetupError(null);   setTxState("idle"); setTxHash(null); setTxError(null);
+    setSetupState("idle");    setWallet(null);         setSmartAccountAddr(null);
+    setSetupError(null);      setPasskeyState("idle"); setPasskey(null);
+    setPasskeyError(null);    setActiveMode(null);
+    setTxState("idle");       setTxHash(null);         setTxError(null);
   };
 
   const txLabel: Record<TxState, string> = {
     idle: "Increment Counter", building: "Building transaction…",
-    signing: "Sign with wallet…", submitting: "Executing on Stellar…",
+    signing: "Sign with authenticator…", submitting: "Executing on Stellar…",
     success: "Increment Again", error: "Retry",
   };
 
+  const isReady = (setupState === "ready" && activeMode === "wallet") ||
+                  (passkeyState === "ready" && activeMode === "passkey");
   const isTxBusy = txState === "building" || txState === "signing" || txState === "submitting";
+  const anySetupBusy =
+    (setupState !== "idle" && setupState !== "error") ||
+    (passkeyState === "registering" || passkeyState === "deploying");
+
+  const signerLabel =
+    activeMode === "passkey" ? "passkey (WebAuthn P-256)"
+    : activeMode === "wallet" ? wallet?.walletType ?? "wallet"
+    : "wallet";
 
   // ─── Render ───────────────────────────────────────────────────────────────
   return (
     <div className="relative flex flex-col min-h-screen pt-24 sm:pt-32 pb-16 overflow-hidden bg-background">
 
-      {/* Background glows — clipped, won't overflow on mobile */}
+      {/* Background glows */}
       <div className="absolute inset-0 z-0 pointer-events-none overflow-hidden" aria-hidden>
         <div className="absolute top-[15%] right-[-10%] w-72 h-72 sm:w-[500px] sm:h-[500px] bg-primary/10 rounded-full blur-[80px] opacity-40 animate-pulse" style={{ animationDuration: "8s" }} />
         <div className="absolute bottom-[5%] left-[-10%] w-56 h-56 sm:w-[400px] sm:h-[400px] bg-primary/5 rounded-full blur-[80px] opacity-30 animate-pulse" style={{ animationDuration: "12s", animationDelay: "2s" }} />
@@ -213,8 +346,8 @@ export default function SmartAccountsPage() {
             Smart Accounts
           </h1>
           <p className="text-base sm:text-lg lg:text-xl font-light text-muted-foreground max-w-2xl">
-            Connect your wallet, mint a Soroban Smart Account via the factory, and interact
-            with on-chain contracts — all from here.
+            Connect your wallet or register a passkey, mint a Soroban Smart Account via the factory,
+            and interact with on-chain contracts — all from here.
           </p>
         </div>
 
@@ -222,46 +355,122 @@ export default function SmartAccountsPage() {
         <div className="rounded-2xl border border-primary/20 bg-card/60 backdrop-blur-lg shadow-2xl overflow-hidden">
           <div className="grid grid-cols-1 lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x divide-border">
 
-            {/* ── LEFT: Wallet selection ─────────────────────────────────── */}
+            {/* ── LEFT: Signer selection ─────────────────────────────────── */}
             <div className="p-6 sm:p-8 space-y-6">
               <div>
-                <h2 className="text-lg sm:text-xl font-mono font-semibold mb-1">1. Connect Wallet</h2>
-                <p className="text-sm text-muted-foreground">Select an Ed25519 signer to own your Smart Account.</p>
+                <h2 className="text-lg sm:text-xl font-mono font-semibold mb-1">1. Choose Signer</h2>
+                <p className="text-sm text-muted-foreground">Pick a wallet or use a passkey stored on your device.</p>
               </div>
 
-              {/* Wallet buttons */}
-              <div className="space-y-3">
-                {WALLETS.map(({ type, label, sub, accent }) => (
+              {/* Solana wallets */}
+              <div className="space-y-2">
+                <p className="text-xs font-mono text-muted-foreground uppercase tracking-wider">Solana</p>
+                {SOLANA_WALLETS.map(({ type, label, sub }) => (
                   <button
                     key={type}
-                    id={`wallet-btn-${type}`}
                     onClick={() => handleConnect(type)}
-                    disabled={setupState !== "idle" && setupState !== "error"}
+                    disabled={anySetupBusy}
                     className="flex items-center gap-3 w-full p-3 sm:p-4 rounded-xl border border-border bg-background hover:bg-muted/50 hover:border-primary/40 disabled:opacity-40 disabled:cursor-not-allowed transition-all text-left"
                   >
-                    <div className={`w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center font-mono font-bold text-sm shrink-0 ${accentClasses[accent]}`}>
+                    <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center font-mono font-bold text-sm shrink-0 bg-indigo-500/10 text-indigo-500">
                       {label[0]}
                     </div>
                     <div className="min-w-0">
                       <div className="font-mono text-sm font-medium truncate">{label}</div>
                       <div className="text-xs text-muted-foreground truncate">{sub}</div>
                     </div>
-                    {wallet?.walletType === type && (
+                    {wallet?.walletType === type && activeMode === "wallet" && (
                       <CheckCircle className="w-4 h-4 text-primary ml-auto shrink-0" />
                     )}
                   </button>
                 ))}
               </div>
 
-              {/* Connected key + deploy button */}
-              {(setupState === "connected" || setupState === "deploying") && wallet && (
+              {/* Divider */}
+              <div className="flex items-center gap-3 text-muted-foreground/40">
+                <div className="flex-1 h-px bg-border" />
+                <span className="text-xs font-mono uppercase tracking-wider">or</span>
+                <div className="flex-1 h-px bg-border" />
+              </div>
+
+              {/* Stellar wallets */}
+              <div className="space-y-2">
+                <p className="text-xs font-mono text-muted-foreground uppercase tracking-wider">Stellar</p>
+                {STELLAR_WALLETS.map(({ type, label, sub }) => (
+                  <button
+                    key={type}
+                    onClick={() => handleConnect(type)}
+                    disabled={anySetupBusy}
+                    className="flex items-center gap-3 w-full p-3 sm:p-4 rounded-xl border border-border bg-background hover:bg-muted/50 hover:border-primary/40 disabled:opacity-40 disabled:cursor-not-allowed transition-all text-left"
+                  >
+                    <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center font-mono font-bold text-sm shrink-0 bg-blue-500/10 text-blue-500">
+                      {label[0]}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-mono text-sm font-medium truncate">{label}</div>
+                      <div className="text-xs text-muted-foreground truncate">{sub}</div>
+                    </div>
+                    {wallet?.walletType === type && activeMode === "wallet" && (
+                      <CheckCircle className="w-4 h-4 text-primary ml-auto shrink-0" />
+                    )}
+                  </button>
+                ))}
+              </div>
+
+              {/* Divider */}
+              <div className="flex items-center gap-3 text-muted-foreground/40">
+                <div className="flex-1 h-px bg-border" />
+                <span className="text-xs font-mono uppercase tracking-wider">or</span>
+                <div className="flex-1 h-px bg-border" />
+              </div>
+
+              {/* Passkey / WebAuthn */}
+              <div className="space-y-2">
+                <p className="text-xs font-mono text-muted-foreground uppercase tracking-wider">Device</p>
+                <button
+                  onClick={handlePasskeyRegister}
+                  disabled={anySetupBusy}
+                  className="flex items-center gap-3 w-full p-3 sm:p-4 rounded-xl border border-border bg-background hover:bg-muted/50 hover:border-primary/40 disabled:opacity-40 disabled:cursor-not-allowed transition-all text-left"
+                >
+                  <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center shrink-0 bg-emerald-500/10 text-emerald-500">
+                    <Fingerprint className="w-5 h-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="font-mono text-sm font-medium truncate">Passkey</div>
+                    <div className="text-xs text-muted-foreground truncate">
+                      {passkeyState === "registering" ? "Creating passkey…" :
+                       passkeyState === "deploying"   ? "Deploying smart account…" :
+                       "Face ID / Touch ID / Hardware key"}
+                    </div>
+                  </div>
+                  {passkeyState === "ready" && activeMode === "passkey" && (
+                    <CheckCircle className="w-4 h-4 text-primary ml-auto shrink-0" />
+                  )}
+                  {(passkeyState === "registering" || passkeyState === "deploying") && (
+                    <Loader2 className="w-4 h-4 text-primary ml-auto shrink-0 animate-spin" />
+                  )}
+                </button>
+
+                {/* Passkey error */}
+                {passkeyError && activeMode === "passkey" && (
+                  <div className="p-4 rounded-xl bg-destructive/10 border border-destructive/20 text-destructive flex items-start gap-3">
+                    <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
+                    <div>
+                      <p className="text-sm font-bold mb-0.5">Error</p>
+                      <p className="text-sm opacity-90 break-words">{passkeyError}</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Connected key + deploy button (wallet mode) */}
+              {activeMode === "wallet" && (setupState === "connected" || setupState === "deploying") && wallet && (
                 <div className="space-y-3 animate-in fade-in slide-in-from-bottom-2 duration-300">
                   <div className="p-3 rounded-xl border bg-muted/30">
                     <p className="text-xs font-mono text-muted-foreground mb-1 uppercase tracking-wider">Connected Key</p>
                     <p className="font-mono text-xs break-all leading-relaxed">{wallet.publicKeyHex}</p>
                   </div>
                   <button
-                    id="create-smart-account-btn"
                     onClick={handleDeploy}
                     disabled={setupState === "deploying"}
                     className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-primary text-primary-foreground font-mono text-sm font-medium hover:bg-primary/90 disabled:opacity-70 transition-colors"
@@ -274,8 +483,8 @@ export default function SmartAccountsPage() {
                 </div>
               )}
 
-              {/* Setup error */}
-              {setupError && (
+              {/* Setup error (wallet) */}
+              {setupError && activeMode === "wallet" && (
                 <div className="p-4 rounded-xl bg-destructive/10 border border-destructive/20 text-destructive flex items-start gap-3">
                   <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
                   <div>
@@ -286,17 +495,16 @@ export default function SmartAccountsPage() {
               )}
 
               {/* Idle state */}
-              {setupState === "idle" && (
+              {!activeMode && (
                 <div className="flex items-center gap-2 text-muted-foreground/50 py-4">
                   <Activity className="w-5 h-5" />
-                  <span className="font-mono text-sm">Awaiting wallet…</span>
+                  <span className="font-mono text-sm">Awaiting signer…</span>
                 </div>
               )}
 
               {/* Disconnect */}
-              {(setupState === "ready" || setupState === "connecting") && (
+              {isReady && (
                 <button
-                  id="disconnect-btn"
                   onClick={reset}
                   className="text-xs text-muted-foreground hover:text-foreground font-mono underline underline-offset-4 transition-colors"
                 >
@@ -313,23 +521,27 @@ export default function SmartAccountsPage() {
               </div>
 
               {/* Connecting spinner */}
-              {setupState === "connecting" && (
+              {(setupState === "connecting" || passkeyState === "registering" || passkeyState === "deploying") && (
                 <div className="flex flex-col items-center justify-center gap-3 py-12 text-primary">
                   <Loader2 className="w-8 h-8 animate-spin" />
-                  <p className="font-mono text-sm animate-pulse text-center">Connecting &amp; checking on-chain…</p>
+                  <p className="font-mono text-sm animate-pulse text-center">
+                    {passkeyState === "registering" ? "Registering passkey…" :
+                     passkeyState === "deploying"   ? "Deploying smart account…" :
+                     "Connecting & checking on-chain…"}
+                  </p>
                 </div>
               )}
 
               {/* Idle / error placeholder */}
-              {(setupState === "idle" || setupState === "error") && (
+              {!activeMode && (
                 <div className="flex flex-col items-center justify-center gap-3 py-12 text-muted-foreground/40">
                   <Activity className="w-8 h-8" />
-                  <p className="font-mono text-sm text-center">Connect a wallet to begin.</p>
+                  <p className="font-mono text-sm text-center">Choose a signer to begin.</p>
                 </div>
               )}
 
               {/* Account ready */}
-              {setupState === "ready" && smartAccountAddr && wallet && (
+              {isReady && smartAccountAddr && (
                 <div className="space-y-5 animate-in fade-in slide-in-from-bottom-4 duration-500">
 
                   {/* C-address */}
@@ -399,14 +611,13 @@ export default function SmartAccountsPage() {
                         </a>
                       </div>
                       <p className="text-xs text-muted-foreground font-mono">
-                        Signed by: {wallet.walletType} → verifier → smart account
+                        Signed by: {signerLabel} → verifier → smart account
                       </p>
                     </div>
                   )}
 
                   {/* Increment button */}
                   <button
-                    id="increment-counter-btn"
                     onClick={handleIncrement}
                     disabled={isTxBusy}
                     className="relative w-full flex items-center justify-center gap-2 px-4 py-3.5 rounded-xl bg-primary text-primary-foreground font-mono text-sm font-medium hover:bg-primary/90 disabled:opacity-70 disabled:cursor-wait transition-all overflow-hidden"
@@ -430,7 +641,6 @@ export default function SmartAccountsPage() {
         </div>
       </div>
 
-      {/* Shimmer keyframe — in a regular <style> tag, valid in App Router */}
       <style>{`@keyframes shimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }`}</style>
     </div>
   );

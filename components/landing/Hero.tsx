@@ -26,7 +26,7 @@ export function Hero() {
               [Architecture]
             </Button>
           </Link>
-          <Link href="/demo">
+          <Link href="/smart-accounts">
             <Button size="lg" variant="outline" className="font-mono h-12 px-8">
               [Demo]
             </Button>

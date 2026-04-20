@@ -8,7 +8,6 @@ import {
   Operation,
   xdr,
   rpc,
-  Contract,
   Address,
 } from "@stellar/stellar-sdk";
 
@@ -18,8 +17,8 @@ const getTestnetConfig = () => {
     networkPassphrase: process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE || Networks.TESTNET,
     verifierAddress: process.env.NEXT_PUBLIC_VERIFIER_ADDRESS!,
     counterAddress: process.env.NEXT_PUBLIC_COUNTER_ADDRESS!,
-    // Fallback to the known demo WASM hash if missing from .env
-    smartAccountWasmHash: process.env.NEXT_PUBLIC_SMART_ACCOUNT_WASM_HASH || "cf67f31cbff555b5a6c1fb3ab4411b9cdf34e96d4d2cf52dbec5d1f13fc6db40",
+    // Fallback to the current constructor-based smart account WASM if missing from .env
+    smartAccountWasmHash: process.env.NEXT_PUBLIC_SMART_ACCOUNT_WASM_HASH || "c00f972cb8ed5eba151f4cd6e97519db679a7a31cc657838449b405fb9cf53c4",
     bundlerSecret: process.env.BUNDLER_SECRET!,
   };
   
@@ -37,6 +36,19 @@ const getTestnetConfig = () => {
 // In production, use a database
 const deployedAccounts: Map<string, { smartAccountAddress: string; gAddress: string }> = new Map();
 
+function buildConstructorArgs(publicKeyHex: string, verifierAddress: string): xdr.ScVal[] {
+  const externalSigner = xdr.ScVal.scvVec([
+    xdr.ScVal.scvSymbol("External"),
+    new Address(verifierAddress).toScVal(),
+    xdr.ScVal.scvBytes(Buffer.from(publicKeyHex, "hex")),
+  ]);
+
+  return [
+    xdr.ScVal.scvVec([externalSigner]),
+    xdr.ScVal.scvMap([]),
+  ];
+}
+
 // Derive Stellar G-address from Ed25519 public key bytes
 function deriveGAddressFromPubkey(pubkeyHex: string): string {
   try {
@@ -48,34 +60,6 @@ function deriveGAddressFromPubkey(pubkeyHex: string): string {
     console.error("Error deriving G-address:", err);
     throw new Error(`Failed to derive G-address from pubkey: ${err instanceof Error ? err.message : String(err)}`);
   }
-}
-
-// Fund account via Friendbot (testnet only)
-async function fundAccountIfNeeded(gAddress: string): Promise<void> {
-  try {
-    // Check if account exists using Horizon API (simpler than Soroban RPC for this)
-    const horizonResponse = await fetch(
-      `https://horizon-testnet.stellar.org/accounts/${gAddress}`
-    );
-    if (horizonResponse.ok) {
-      console.log(`Account ${gAddress} already funded`);
-      return;
-    }
-  } catch (err) {
-    console.log(`Account check failed, will try to fund:`, err);
-  }
-
-  // Account doesn't exist, fund via Friendbot
-  console.log(`Funding account ${gAddress} via Friendbot...`);
-  const response = await fetch(
-    `https://friendbot.stellar.org?addr=${encodeURIComponent(gAddress)}`
-  );
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`Friendbot error:`, errorText);
-    throw new Error(`Failed to fund account: ${response.statusText}`);
-  }
-  console.log(`Account ${gAddress} funded successfully`);
 }
 
 export async function POST(request: NextRequest) {
@@ -104,13 +88,11 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Fund the user's G-address via Friendbot (testnet)
-    await fundAccountIfNeeded(userGAddress);
-
     // Generate deterministic salt from pubkey + version
-    const SMART_ACCOUNT_VERSION = "v6";
+    const SMART_ACCOUNT_VERSION = "v8-ed25519-verifier-fix";
     const saltHex = crypto.createHash("sha256").update(publicKeyHex + SMART_ACCOUNT_VERSION).digest("hex");
     const salt = Buffer.from(saltHex, "hex");
+    const constructorArgs = buildConstructorArgs(publicKeyHex, TESTNET_CONFIG.verifierAddress);
 
     console.log(`Deploying smart account for pubkey: ${publicKeyHex}`);
     console.log(`Using salt: ${saltHex}`);
@@ -135,6 +117,7 @@ export async function POST(request: NextRequest) {
             address: new Address(bundlerKeypair.publicKey()),
             wasmHash: Buffer.from(TESTNET_CONFIG.smartAccountWasmHash, "hex"),
             salt: salt,
+            constructorArgs,
           })
         )
         .setTimeout(300)
@@ -177,7 +160,7 @@ export async function POST(request: NextRequest) {
         const result = deployTxResult as rpc.Api.GetSuccessfulTransactionResponse;
         const returnValue = result.returnValue;
         if (returnValue) {
-          smartAccountAddress = Address.fromScAddress(returnValue as any).toString();
+          smartAccountAddress = Address.fromScVal(returnValue).toString();
           console.log(`Deployed smart account: ${smartAccountAddress}`);
         } else {
           throw new Error("No return value from deployment transaction");
@@ -228,67 +211,7 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // Initialize the smart account with the Phantom pubkey using SDK
-    try {
-      const contract = new Contract(smartAccountAddress);
-      const bundlerAccount = await server.getAccount(bundlerKeypair.publicKey());
-
-      const initTx = new TransactionBuilder(bundlerAccount, {
-        fee: "1000000",
-        networkPassphrase: TESTNET_CONFIG.networkPassphrase,
-      })
-        .addOperation(
-          contract.call(
-            "initialize",
-            new Address(TESTNET_CONFIG.verifierAddress).toScVal(),
-            xdr.ScVal.scvBytes(Buffer.from(publicKeyHex, "hex")),
-            new Address(TESTNET_CONFIG.counterAddress).toScVal()
-          )
-        )
-        .setTimeout(300)
-        .build();
-
-      // Simulate initialization to get footprint
-      const initSimResult = await server.simulateTransaction(initTx);
-
-      if (rpc.Api.isSimulationError(initSimResult)) {
-        throw new Error(`Initialization simulation failed: ${initSimResult.error}`);
-      }
-
-      // Assemble with correct footprint
-      const assembledInitTx = rpc.assembleTransaction(initTx, initSimResult).build();
-      assembledInitTx.sign(bundlerKeypair);
-
-      const initResult = await server.sendTransaction(assembledInitTx);
-
-      if (initResult.status === "ERROR") {
-        throw new Error(`Initialization failed: ${initResult.errorResult?.toXDR("base64")}`);
-      }
-
-      // Wait for confirmation
-      for (let i = 0; i < 30; i++) {
-        await new Promise((r) => setTimeout(r, 1000));
-        const txResult = await server.getTransaction(initResult.hash);
-        if (txResult.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) {
-          if (txResult.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-            console.log(`✅ Initialized smart account - context rule added for counter contract`);
-          } else {
-            console.error(`❌ Initialization transaction failed with status: ${txResult.status}`);
-          }
-          break;
-        }
-      }
-    } catch (initError: unknown) {
-      const errorMessage = initError instanceof Error ? initError.message : String(initError);
-      // Error #3001 = DuplicateContextRule (already initialized)
-      // Error #3000 = ContextRuleNotFound (shouldn't happen but harmless)
-      if (errorMessage.includes("#3001") || errorMessage.includes("already") || errorMessage.includes("ExistingValue")) {
-        console.log(`Smart account already initialized (context rule exists)`);
-      } else {
-        console.error("Init error:", errorMessage.substring(0, 200));
-        // Continue anyway - might already be initialized
-      }
-    }
+    console.log(`✅ Smart account deployed with constructor signers`);
 
     // Cache the deployment
     deployedAccounts.set(publicKeyHex, { smartAccountAddress, gAddress: userGAddress });
@@ -317,9 +240,10 @@ export async function POST(request: NextRequest) {
 }
 
 export async function GET() {
+  const config = getTestnetConfig();
   return NextResponse.json({
-    verifierAddress: TESTNET_CONFIG.verifierAddress,
-    counterAddress: TESTNET_CONFIG.counterAddress,
+    verifierAddress: config.verifierAddress,
+    counterAddress: config.counterAddress,
     network: "testnet",
   });
 }

@@ -83,15 +83,17 @@ export async function POST(request: NextRequest) {
 
     const authEntry = xdr.SorobanAuthorizationEntry.fromXDR(authEntryXdr, "base64");
 
-    // Recompute authDigest = sha256(signaturePayload || context_rule_ids.to_xdr()).
     const signaturePayload = hashSorobanAuthPayload(authEntry, TESTNET_CONFIG.networkPassphrase);
-    const ruleIdsXdr = xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]).toXDR();
-    const authDigestHex = hash(Buffer.concat([signaturePayload, Buffer.from(ruleIdsXdr)])).toString("hex");
+    const signaturePayloadHex = signaturePayload.toString("hex");
+    const contextRuleIds = [0];
+    const ruleIdsXdr = xdr.ScVal.scvVec(contextRuleIds.map((id) => xdr.ScVal.scvU32(id))).toXDR();
+    const authDigest = hash(Buffer.concat([signaturePayload, Buffer.from(ruleIdsXdr)]));
+    const authDigestHex = authDigest.toString("hex");
     const signedPayloadHex = prefixedMessage.slice(EXPECTED_PREFIX.length);
     if (signedPayloadHex !== authDigestHex) {
       return NextResponse.json(
         {
-          error: `Signed auth hash does not match recomputed authDigest. signed=${signedPayloadHex} expected=${authDigestHex}`,
+          error: `Signed auth hash does not match authDigest. signed=${signedPayloadHex} expected=${authDigestHex}. If this page was already open, hard refresh and try again.`,
         },
         { status: 400 }
       );
@@ -105,10 +107,11 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Build the Signatures tuple struct for the smart account auth.
-    // The stellar_accounts crate defines:
-    // pub struct Signatures(pub Map<Signer, Bytes>);
-    // As a tuple struct, it serializes to XDR as an ScVec of length 1.
+    // Build the OZ AuthPayload:
+    //   { context_rule_ids: [0], signers: { External(verifier, pubkey) => sig_data } }
+    // The signers map value is passed verbatim as the Bytes argument to verifier.verify().
+    // The Ed25519 phantom verifier sig_data type is BytesN<64> — raw 64-byte signature.
+    // Do NOT XDR-wrap it: OZ stores it as raw Bytes and the host wraps in scvBytes when calling.
     const phantomPubkeyBytes = Buffer.from(publicKeyHex, "hex");
     if (phantomPubkeyBytes.length !== 32) {
       return NextResponse.json(
@@ -123,21 +126,17 @@ export async function POST(request: NextRequest) {
       xdr.ScVal.scvBytes(phantomPubkeyBytes),
     ]);
 
-    // Build the Signatures structure as an ScMap.
-    // The previously successful (though failing at verifier) diagnostic logs show
-    // that the contract expects a Map with "context_rule_ids" and "signers".
     const signaturesScVal = xdr.ScVal.scvMap([
       new xdr.ScMapEntry({
         key: xdr.ScVal.scvSymbol("context_rule_ids"),
-        val: xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]), // Use rule ID 0 (default counter rule)
+        val: xdr.ScVal.scvVec(contextRuleIds.map((id) => xdr.ScVal.scvU32(id))),
       }),
       new xdr.ScMapEntry({
         key: xdr.ScVal.scvSymbol("signers"),
         val: xdr.ScVal.scvMap([
           new xdr.ScMapEntry({
             key: signerKey,
-            // Verifier interface: verify(hash: Bytes, key_data: BytesN<32>, sig_data: BytesN<64>).
-            // Soroban represents both Bytes and BytesN as ScVal.scvBytes; BytesN is enforced by length.
+            // Raw 64-byte signature — the verifier's SigData type is BytesN<64>.
             val: xdr.ScVal.scvBytes(authSignatureBytes),
           }),
         ]),
@@ -271,7 +270,7 @@ export async function POST(request: NextRequest) {
         {
           error: `Auth validation failed: ${enforcingSim.error}`,
           verifierHashHex,
-          authDigestHex,
+          signaturePayloadHex,
           localVerifyPrefixPlusHexUtf8,
           localVerifyPrefixPlusRawHash,
         },

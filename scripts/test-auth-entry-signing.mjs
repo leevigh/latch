@@ -174,7 +174,7 @@ console.log(`\nSignature Payload: ${signaturePayloadHex}`);
 console.log(`Auth Digest: ${authDigestHex}`);
 
 // Construct prefixed message and sign (Phantom wallet would do this)
-const prefixedMessage = AUTH_PREFIX + authDigestHex;
+const prefixedMessage = AUTH_PREFIX + signaturePayloadHex;
 const prefixedMessageBytes = Buffer.from(prefixedMessage, "utf-8");
 const signature = nacl.sign.detached(prefixedMessageBytes, clientKeypair.secretKey);
 

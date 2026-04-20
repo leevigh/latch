@@ -37,18 +37,26 @@ function deriveSalt(publicKeyHex: string): Buffer {
 
 // Shared: builds the AccountInitParams ScVal map
 function buildParamsMap(publicKeyHex: string, salt: Buffer): xdr.ScVal {
-  const signerStruct = xdr.ScVal.scvMap([
+  // ExternalSignerInit struct — fields must be in alphabetical key order (Soroban map encoding)
+  const externalSignerInit = xdr.ScVal.scvMap([
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("key_data"),
       val: xdr.ScVal.scvBytes(Buffer.from(publicKeyHex, "hex")),
     }),
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("signer_kind"),
-      // Soroban #[contracttype] enums serialize as ScVec([Symbol("VariantName")])
+      // SignerKind::Ed25519 — unit enum variant: Vec([Symbol("Ed25519")])
       val: xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("Ed25519")]),
     }),
   ]);
 
+  // AccountSignerInit::External(ExternalSignerInit) — tuple enum variant: Vec([Symbol("External"), payload])
+  const accountSigner = xdr.ScVal.scvVec([
+    xdr.ScVal.scvSymbol("External"),
+    externalSignerInit,
+  ]);
+
+  // AccountInitParams struct — fields in alphabetical key order
   return xdr.ScVal.scvMap([
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("account_salt"),
@@ -56,7 +64,7 @@ function buildParamsMap(publicKeyHex: string, salt: Buffer): xdr.ScVal {
     }),
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("signers"),
-      val: xdr.ScVal.scvVec([signerStruct]),
+      val: xdr.ScVal.scvVec([accountSigner]),
     }),
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("threshold"),
