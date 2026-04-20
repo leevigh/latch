@@ -235,8 +235,11 @@ export async function POST(request: NextRequest) {
     );
     const assembledTx = assembledBuilder.build();
 
-    // External signers must sign authDigest = sha256(signaturePayload || context_rule_ids.to_xdr()).
-    const ruleIdsXdr = xdr.ScVal.scvVec([xdr.ScVal.scvU32(contextRuleId)]).toXDR();
+    // signaturePayload is the Soroban auth payload hash (32 bytes).
+    const signaturePayload = hashSorobanAuthPayload(authEntry, TESTNET_CONFIG.networkPassphrase);
+    // The current smart-account contract binds context_rule_ids into auth_digest
+    // before calling the verifier, so external signers must sign authDigestHex.
+    const ruleIdsXdr = xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]).toXDR();
     const authDigest = hash(Buffer.concat([signaturePayload, Buffer.from(ruleIdsXdr)]));
     const authDigestHex = authDigest.toString("hex");
     const authDigestBase64 = authDigest.toString("base64");
@@ -277,11 +280,9 @@ export async function POST(request: NextRequest) {
         minResourceFee: simResult.minResourceFee,
         latestLedger: simResult.latestLedger,
       }),
-      // For external-verifier flows: client signs a prefixed UTF-8 message containing authDigestHex.
+      // Client signs: "Stellar Smart Account Auth:\n" + authDigestHex (lowercase hex)
       authDigestHex,
-      // For smart-account custom Signatures: client signs the raw 32-byte digest (not host native auth for G).
-      authDigestBase64,
-      // Keep for debugging/visibility; not what external signers should sign.
+      // Raw Soroban auth payload hash, kept for diagnostics/debugging.
       signaturePayloadHex: signaturePayload.toString("hex"),
       validUntilLedger,
     });

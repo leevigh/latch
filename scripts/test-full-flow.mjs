@@ -241,8 +241,8 @@ async function testFullFlow() {
   console.log(`Auth Digest (hex): ${authDigestHex}`);
   console.log(`Auth Digest (bytes): ${authDigest.length} bytes`);
 
-  // Construct prefixed message (what Phantom signs)
-  const prefixedMessage = AUTH_PREFIX + authDigestHex;
+  // Construct prefixed message (what the latch-demo verifier expects Phantom to sign)
+  const prefixedMessage = AUTH_PREFIX + signaturePayloadHex;
   const prefixedMessageBytes = Buffer.from(prefixedMessage, "utf-8");
 
   console.log(`\nPrefixed Message: "${prefixedMessage}"`);
@@ -278,7 +278,6 @@ async function testFullFlow() {
   ]);
 
   const sigDataXdr = sigDataMap.toXDR();
-  const sigDataBytes = xdr.ScVal.scvBytes(sigDataXdr);
 
   console.log(`Ed25519SigData XDR Size: ${sigDataXdr.length} bytes`);
 
@@ -296,20 +295,11 @@ async function testFullFlow() {
   const sigInnerMap = xdr.ScVal.scvMap([
     new xdr.ScMapEntry({
       key: signerKey,
-      val: sigDataBytes,
+      val: xdr.ScVal.scvBytes(sigDataXdr),
     }),
   ]);
 
-  const authPayloadMap = xdr.ScVal.scvMap([
-    new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("context_rule_ids"),
-      val: xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]),
-    }),
-    new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("signers"),
-      val: sigInnerMap,
-    }),
-  ]);
+  const signaturesScVal = xdr.ScVal.scvVec([sigInnerMap]);
 
   console.log("Signature Map Structure:");
   console.log(`  Signer Type: External`);
@@ -318,7 +308,7 @@ async function testFullFlow() {
 
   // Set signature on auth entry
   const credentials = parsedAuthEntry.credentials().address();
-  credentials.signature(authPayloadMap);
+  credentials.signature(signaturesScVal);
 
   console.log("\n✅ Auth entry signed");
 

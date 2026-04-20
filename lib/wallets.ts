@@ -1,4 +1,4 @@
-import { isAllowed, setAllowed, getPublicKey, isConnected as isFreighterConnected } from "@stellar/freighter-api";
+import { isAllowed, setAllowed, getAddress, isConnected as isFreighterConnected } from "@stellar/freighter-api";
 import { isConnected as isLobstrConnected, getPublicKey as getLobstrPublicKey } from "@lobstrco/signer-extension-api";
 import bs58 from "bs58";
 import { StrKey } from "@stellar/stellar-sdk";
@@ -48,17 +48,21 @@ export async function connectPhantom(): Promise<WalletConnectionResult> {
 }
 
 export async function connectFreighter(): Promise<WalletConnectionResult> {
-    const connected = await isFreighterConnected();
-    if (!connected) throw new Error("Freighter wallet not found. Please install the Freighter extension.");
-    
-    // We request permissions if not already allowed
-    if (await isAllowed() === false) {
+    const { isConnected, error: connErr } = await isFreighterConnected();
+    if (connErr) throw new Error(`Freighter error: ${connErr.message}`);
+    if (!isConnected) throw new Error("Freighter wallet not found. Please install the Freighter extension.");
+
+    // Request permissions if not already allowed
+    const { isAllowed: allowed } = await isAllowed();
+    if (!allowed) {
       await setAllowed();
     }
-    const publicKey = await getPublicKey();
-    if (!publicKey) throw new Error("Freighter did not return a public key.");
-    
-    const { hex, gAddress } = deriveKeysFromStellar(publicKey);
+
+    const { address, error: addrErr } = await getAddress();
+    if (addrErr) throw new Error(`Freighter error: ${addrErr.message}`);
+    if (!address) throw new Error("Freighter did not return a public key.");
+
+    const { hex, gAddress } = deriveKeysFromStellar(address);
     return { publicKeyHex: hex, gAddress, walletType: "freighter" };
 }
 
