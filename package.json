@@ -85,6 +85,9 @@
     "vaul": "^1.1.2",
     "zod": "3.25.67"
   },
+  "pnpm": {
+    "onlyBuiltDependencies": ["better-sqlite3", "cbor-extract", "unrs-resolver"]
+  },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.9",
     "@types/base64url": "^2.0.3",
