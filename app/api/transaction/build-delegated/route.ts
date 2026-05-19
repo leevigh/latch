@@ -9,10 +9,13 @@ import {
   rpc,
   Keypair,
   Operation,
-  hash,
 } from "@stellar/stellar-sdk";
 import { assembleTransaction } from "@stellar/stellar-sdk/rpc";
-import { hashSorobanAuthPayload } from "@/lib/soroban-auth-payload";
+import {
+  computeAuthDigest,
+  hashSorobanAuthPayload,
+} from "@/lib/soroban-auth-payload";
+import { discoverContextRule } from "@/lib/soroban-context-rules";
 
 const getConfig = () => ({
   rpcUrl: process.env.NEXT_PUBLIC_RPC_URL || "https://soroban-testnet.stellar.org",
@@ -34,7 +37,7 @@ const getConfig = () => ({
  *
  * Signer::Delegated(addr) XDR: scvVec([ scvSymbol("Delegated"), addr.toScVal() ])
  */
-function buildDelegatedAuthPayload(gAddress: string): xdr.ScVal {
+function buildDelegatedAuthPayload(gAddress: string, contextRuleId: number): xdr.ScVal {
   const signerKey = xdr.ScVal.scvVec([
     xdr.ScVal.scvSymbol("Delegated"),
     new Address(gAddress).toScVal(),
@@ -43,7 +46,7 @@ function buildDelegatedAuthPayload(gAddress: string): xdr.ScVal {
   return xdr.ScVal.scvMap([
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("context_rule_ids"),
-      val: xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]),
+      val: xdr.ScVal.scvVec([xdr.ScVal.scvU32(contextRuleId)]),
     }),
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("signers"),
@@ -76,6 +79,14 @@ export async function POST(request: NextRequest) {
     }
 
     const bundlerAccount = await server.getAccount(bundlerKeypair.publicKey());
+
+    const { contextRuleId } = await discoverContextRule(
+      server,
+      config.networkPassphrase,
+      smartAccountAddress,
+      config.counterAddress
+    );
+
     const contract = new Contract(config.counterAddress);
 
     const tx = new TransactionBuilder(bundlerAccount, {
@@ -127,13 +138,10 @@ export async function POST(request: NextRequest) {
     // Compute signaturePayload = sha256(soroban-auth preimage) for the smart account entry
     const signaturePayload = hashSorobanAuthPayload(rawEntry, config.networkPassphrase);
 
-    // auth_digest = sha256(signaturePayload || context_rule_ids.to_xdr())
-    // context_rule_ids = [0] — must match what's in the AuthPayload below
-    const ruleIdsXdr = xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]).toXDR();
-    const authDigest = hash(Buffer.concat([signaturePayload, Buffer.from(ruleIdsXdr)]));
+    const authDigest = computeAuthDigest(rawEntry, config.networkPassphrase, [contextRuleId]);
 
     // Set AuthPayload as the signature on the smart account auth entry
-    const authPayload = buildDelegatedAuthPayload(gAddress);
+    const authPayload = buildDelegatedAuthPayload(gAddress, contextRuleId);
     smartAccountCreds.signature(authPayload);
 
     // Build the G-address auth entry for Freighter to sign.
@@ -194,6 +202,7 @@ export async function POST(request: NextRequest) {
       gAddressEntryTemplateXdr: gAddrEntry.toXDR("base64"), // passed to submit-delegated
       authDigestHex: authDigest.toString("hex"),
       validUntilLedger,
+      contextRuleId,
     });
   } catch (error) {
     console.error("Error building delegated transaction:", error);

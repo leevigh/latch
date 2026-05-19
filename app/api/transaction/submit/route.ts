@@ -11,7 +11,14 @@ import {
   scValToNative,
   hash,
 } from "@stellar/stellar-sdk";
-import { hashSorobanAuthPayload } from "@/lib/soroban-auth-payload";
+import {
+  computeAuthDigestHex,
+  hashSorobanAuthPayload,
+} from "@/lib/soroban-auth-payload";
+import {
+  rebuildTxWithAuthEntries,
+  submitWithBundler,
+} from "@/lib/soroban-transaction-submit";
 import nacl from "tweetnacl";
 
 const getConfig = () => ({
@@ -52,11 +59,28 @@ export async function POST(request: NextRequest) {
       authSignatureHex,  // Phantom signature for smart account authorization
       prefixedMessage,    // The full message that was signed (PREFIX + hex(payload))
       publicKeyHex,
+      contextRuleId,
     } = await request.json();
 
-    if (!txXdr || !authEntryXdr || !authSignatureHex || !prefixedMessage || !publicKeyHex) {
+    if (
+      !txXdr ||
+      !authEntryXdr ||
+      !authSignatureHex ||
+      !prefixedMessage ||
+      !publicKeyHex ||
+      contextRuleId === undefined ||
+      contextRuleId === null
+    ) {
       return NextResponse.json(
-        { error: "Missing required parameters" },
+        { error: "Missing required parameters (including contextRuleId)" },
+        { status: 400 }
+      );
+    }
+
+    const ruleId = Number(contextRuleId);
+    if (!Number.isInteger(ruleId) || ruleId < 0) {
+      return NextResponse.json(
+        { error: "contextRuleId must be a non-negative integer" },
         { status: 400 }
       );
     }
@@ -98,10 +122,12 @@ export async function POST(request: NextRequest) {
 
     const signaturePayload = hashSorobanAuthPayload(authEntry, TESTNET_CONFIG.networkPassphrase);
     const signaturePayloadHex = signaturePayload.toString("hex");
-    const contextRuleIds = [0];
-    const ruleIdsXdr = xdr.ScVal.scvVec(contextRuleIds.map((id) => xdr.ScVal.scvU32(id))).toXDR();
-    const authDigest = hash(Buffer.concat([signaturePayload, Buffer.from(ruleIdsXdr)]));
-    const authDigestHex = authDigest.toString("hex");
+    const contextRuleIds = [ruleId];
+    const authDigestHex = computeAuthDigestHex(
+      authEntry,
+      TESTNET_CONFIG.networkPassphrase,
+      contextRuleIds
+    );
     const signedPayloadHex = prefixedMessage.slice(EXPECTED_PREFIX.length);
     if (signedPayloadHex !== authDigestHex) {
       return NextResponse.json(
@@ -160,37 +186,22 @@ export async function POST(request: NextRequest) {
     const credentials = authEntry.credentials().address();
     credentials.signature(signaturesScVal);
 
-    const env = tx.toEnvelope();
-    if (env.switch().name !== "envelopeTypeTx") {
-      return NextResponse.json({ error: "Expected a v1 transaction envelope" }, { status: 400 });
-    }
-    const txExt = env.v1().tx().ext();
-    if (txExt.switch() === 0) {
+    let txWithAuth: Transaction;
+    try {
+      txWithAuth = rebuildTxWithAuthEntries(tx, TESTNET_CONFIG.networkPassphrase, [
+        authEntry,
+      ]);
+    } catch (e) {
       return NextResponse.json(
         {
           error:
-            "Transaction is missing Soroban resource data. Call /api/transaction/build again and submit the new txXdr.",
+            e instanceof Error
+              ? e.message
+              : "Transaction is missing Soroban resource data. Rebuild and submit again.",
         },
         { status: 400 }
       );
     }
-    const sorobanData = txExt.value() as xdr.SorobanTransactionData;
-
-    const origOp = tx.operations[0] as Operation.InvokeHostFunction;
-    const tb = TransactionBuilder.cloneFrom(tx, {
-      fee: tx.fee,
-      sorobanData,
-      networkPassphrase: TESTNET_CONFIG.networkPassphrase,
-    });
-    tb.clearOperations();
-    tb.addOperation(
-      Operation.invokeHostFunction({
-        source: origOp.source,
-        func: origOp.func,
-        auth: [authEntry],
-      })
-    );
-    const txWithAuth = tb.build();
 
     const extractVerifierHashHexFromDiagnostics = (diagnosticEventsXdr: unknown): string | undefined => {
       const events = Array.isArray(diagnosticEventsXdr) ? diagnosticEventsXdr : [];
@@ -291,128 +302,23 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // assembleTransaction applies correct footprint + resource fees automatically
-    const assembledTx = rpc.assembleTransaction(txWithAuth, enforcingSim).build();
-
-    console.log(`Enforcing Mode: fee=${assembledTx.fee}, minResourceFee=${enforcingSim.minResourceFee}`);
-
-    // Sign the envelope with bundler keypair (server-side)
-    const bundlerKeypair = Keypair.fromSecret(TESTNET_CONFIG.bundlerSecret);
-
-    // Ensure fee-payer exists on testnet.
-    try {
-      await server.getAccount(bundlerKeypair.publicKey());
-    } catch (e: any) {
-      const msg = String(e?.message ?? e);
-      if (msg.includes("Account not found")) {
-        await fundAccountIfNeeded(bundlerKeypair.publicKey());
-      } else {
-        throw e;
-      }
-    }
-    assembledTx.sign(bundlerKeypair);
-
-    // Submit
-    const sendResult = await server.sendTransaction(assembledTx);
-
-    if (sendResult.status === "ERROR") {
-      throw new Error(
-        `Transaction submission failed: ${sendResult.errorResult?.toXDR("base64")}`
-      );
+    if (!rpc.Api.isSimulationSuccess(enforcingSim)) {
+      throw new Error("Enforcing simulation did not succeed");
     }
 
-    // Poll for result
-    const txHash = sendResult.hash;
-    console.log(`\n✅ Transaction submitted: ${txHash}`);
-    console.log(`   View on explorer: https://stellar.expert/explorer/testnet/tx/${txHash}`);
+    const { hash: txHash, status } = await submitWithBundler({
+      server,
+      networkPassphrase: TESTNET_CONFIG.networkPassphrase,
+      bundlerSecret: TESTNET_CONFIG.bundlerSecret,
+      txWithAuth,
+    });
 
-    let txResult: rpc.Api.GetTransactionResponse | undefined;
+    console.log(`Transaction submitted: ${txHash}`);
 
-    for (let i = 0; i < 30; i++) {
-      await new Promise((r) => setTimeout(r, 1000));
-      txResult = await server.getTransaction(txHash);
-
-      if (txResult.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) {
-        break;
-      }
-    }
-
-    if (txResult!.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-      return NextResponse.json({
-        hash: txHash,
-        status: "SUCCESS",
-      });
-    }
-
-    // Get detailed error information
-    let errorDetail: string = txResult!.status;
-    if (txResult!.status === rpc.Api.GetTransactionStatus.FAILED) {
-      const result = txResult as rpc.Api.GetFailedTransactionResponse;
-
-      // Log diagnostic events to understand what failed
-      if ('diagnosticEventsXdr' in result && Array.isArray((result as any).diagnosticEventsXdr)) {
-        console.error("\n=== Diagnostic Events ===");
-        (result as any).diagnosticEventsXdr.forEach((diagnosticEvent: any, i: number) => {
-          try {
-            // diagnosticEvent is already a parsed XDR object
-            const event = diagnosticEvent._attributes.event;
-            const eventType = event._attributes.type?._switch?.name || 'unknown';
-            console.error(`\nEvent ${i} (${eventType}):`);
-
-            if (eventType === 'contract') {
-              const body = event._attributes.body?._value;
-              if (body) {
-                const topics = body._attributes?.topics?._value || [];
-                const data = body._attributes?.data;
-                console.error(`  Topics:`, topics.map((t: any) => {
-                  try {
-                    const val = t._switch?.name || JSON.stringify(t);
-                    return val;
-                  } catch {
-                    return '[complex]';
-                  }
-                }));
-                console.error(`  Data:`, data);
-              }
-            }
-          } catch (e) {
-            console.error(`Event ${i}: Error extracting -`, e);
-          }
-        });
-      }
-
-      // resultXdr is already an XDR object, not a string
-      const parsedResult = result.resultXdr as xdr.TransactionResult;
-      const resultCode = parsedResult.result().switch().name;
-      const opResults = parsedResult.result().results();
-
-      console.error("Transaction result code:", resultCode);
-
-      if (opResults && opResults.length > 0) {
-        const opResult = opResults[0];
-        const opResultCode = opResult.switch().name;
-        console.error("Operation result code:", opResultCode);
-
-        if (opResultCode === "opInner") {
-          const innerResult = opResult.value();
-          const invokeResult = (innerResult as any).switch().name;
-          console.error("Invoke result:", invokeResult);
-
-          // If it's invokeHostFunctionTrapped, get the diagnostic events
-          if (invokeResult === "invokeHostFunctionTrapped") {
-            errorDetail = `${result.status} - Contract execution failed (trapped)`;
-          } else {
-            errorDetail = `${result.status} - ${resultCode} - ${opResultCode} - ${invokeResult}`;
-          }
-        } else {
-          errorDetail = `${result.status} - ${resultCode} - ${opResultCode}`;
-        }
-      } else {
-        errorDetail = `${result.status} - ${resultCode}`;
-      }
-    }
-
-    throw new Error(`Transaction failed: ${errorDetail}`);
+    return NextResponse.json({
+      hash: txHash,
+      status,
+    });
   } catch (error) {
     console.error("Error submitting transaction:", error);
     return NextResponse.json(

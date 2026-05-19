@@ -9,11 +9,12 @@ import {
   Keypair,
   Operation,
   hash,
-  Account,
-  scValToNative,
 } from "@stellar/stellar-sdk";
 import { assembleTransaction } from "@stellar/stellar-sdk/rpc";
-import { hashSorobanAuthPayload } from "@/lib/soroban-auth-payload";
+import {
+  computeAuthDigestHex,
+  hashSorobanAuthPayload,
+} from "@/lib/soroban-auth-payload";
 import {
   addressStringFromCredentials,
   classifyAuthEntryRole,
@@ -23,6 +24,7 @@ import {
   setAddressCredentialExpiration,
 } from "@/lib/soroban-auth-entries";
 import { buildUnsignedDelegatedGCheckAuthEntry } from "@/lib/delegated-native-auth-entry";
+import { discoverContextRule } from "@/lib/soroban-context-rules";
 
 const getConfig = () => ({
   rpcUrl: process.env.NEXT_PUBLIC_RPC_URL || "https://soroban-testnet.stellar.org",
@@ -63,52 +65,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Discover the context rule id that applies to calling the counter contract.
-    // Many smart accounts have multiple context rules; hardcoding 0 can lead to auth failure.
-    let contextRuleId = 0;
-    let contextRuleDiscovery: "matched" | "fallback" = "fallback";
-    try {
-      const smartAccount = new Contract(smartAccountAddress);
-      const dummyKp = Keypair.random();
-      const dummyAccount = new Account(dummyKp.publicKey(), "0");
-
-      const countTx = new TransactionBuilder(dummyAccount, {
-        fee: "100",
-        networkPassphrase: TESTNET_CONFIG.networkPassphrase,
-      })
-        .addOperation(smartAccount.call("get_context_rules_count"))
-        .setTimeout(30)
-        .build();
-
-      const countSim = await server.simulateTransaction(countTx);
-      if (rpc.Api.isSimulationSuccess(countSim)) {
-        const count = Number(scValToNative(countSim.result!.retval));
-        for (let id = 0; id < count; id++) {
-          const ruleTx = new TransactionBuilder(dummyAccount, {
-            fee: "100",
-            networkPassphrase: TESTNET_CONFIG.networkPassphrase,
-          })
-            .addOperation(smartAccount.call("get_context_rule", xdr.ScVal.scvU32(id)))
-            .setTimeout(30)
-            .build();
-          const ruleSim = await server.simulateTransaction(ruleTx);
-          if (!rpc.Api.isSimulationSuccess(ruleSim)) continue;
-          const ruleNative: any = scValToNative(ruleSim.result!.retval);
-          const ctxType = ruleNative?.context_type ?? ruleNative?.contextType ?? ruleNative?.context;
-          const isCallCounter =
-            ctxType &&
-            typeof ctxType === "object" &&
-            (ctxType.CallContract === TESTNET_CONFIG.counterAddress || ctxType.callContract === TESTNET_CONFIG.counterAddress);
-          if (isCallCounter) {
-            contextRuleId = id;
-            contextRuleDiscovery = "matched";
-            break;
-          }
-        }
-      }
-    } catch {
-      contextRuleDiscovery = "fallback";
-    }
+    const { contextRuleId, discovery: contextRuleDiscovery } = await discoverContextRule(
+      server,
+      TESTNET_CONFIG.networkPassphrase,
+      smartAccountAddress,
+      TESTNET_CONFIG.counterAddress
+    );
 
     // Build the transaction using bundler account as source (pays fees, signs envelope)
     let account;
@@ -239,9 +201,11 @@ export async function POST(request: NextRequest) {
     // const signaturePayload = hashSorobanAuthPayload(authEntry, TESTNET_CONFIG.networkPassphrase);
     // The current smart-account contract binds context_rule_ids into auth_digest
     // before calling the verifier, so external signers must sign authDigestHex.
-    const ruleIdsXdr = xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]).toXDR();
-    const authDigest = hash(Buffer.concat([signaturePayload, Buffer.from(ruleIdsXdr)]));
-    const authDigestHex = authDigest.toString("hex");
+    const authDigestHex = computeAuthDigestHex(
+      smartAccountAuthEntry,
+      TESTNET_CONFIG.networkPassphrase,
+      [contextRuleId]
+    );
     // const authDigestBase64 = authDigest.toString("base64");
 
     // Handle transactionData - may be string, XDR object, or SorobanDataBuilder

@@ -6,9 +6,11 @@ import {
   xdr,
   rpc,
   Transaction,
-  Operation,
-  Keypair,
 } from "@stellar/stellar-sdk";
+import {
+  rebuildTxWithAuthEntries,
+  submitWithBundler,
+} from "@/lib/soroban-transaction-submit";
 
 const getConfig = () => ({
   rpcUrl: process.env.NEXT_PUBLIC_RPC_URL || "https://soroban-testnet.stellar.org",
@@ -73,57 +75,19 @@ export async function POST(request: NextRequest) {
     const gAddrEntry = xdr.SorobanAuthorizationEntry.fromXDR(gAddressEntryTemplateXdr, "base64");
     gAddrEntry.credentials().address().signature(xdr.ScVal.scvVec([accountSig]));
 
-    const authEntries = [smartAccountEntry, gAddrEntry];
+    const txWithAuth = rebuildTxWithAuthEntries(tx, config.networkPassphrase, [
+      smartAccountEntry,
+      gAddrEntry,
+    ]);
 
-    // Rebuild operation with the signed auth entries
-    const sorobanData = tx.toEnvelope().v1().tx().ext().value() as xdr.SorobanTransactionData;
-    const origOp = tx.operations[0] as Operation.InvokeHostFunction;
-    const tb = TransactionBuilder.cloneFrom(tx, {
-      fee: tx.fee,
-      sorobanData,
+    const { hash: txHash, status } = await submitWithBundler({
+      server,
       networkPassphrase: config.networkPassphrase,
+      bundlerSecret: config.bundlerSecret,
+      txWithAuth,
     });
-    tb.clearOperations();
-    tb.addOperation(
-      Operation.invokeHostFunction({
-        source: origOp.source,
-        func: origOp.func,
-        auth: authEntries,
-      })
-    );
-    const txWithAuth = tb.build();
 
-    // Enforcing simulation — validates all auth entries and gets final fees/footprint
-    const enforcingSim = await server.simulateTransaction(txWithAuth);
-    if (rpc.Api.isSimulationError(enforcingSim)) {
-      return NextResponse.json(
-        { error: `Auth validation failed: ${enforcingSim.error}` },
-        { status: 400 }
-      );
-    }
-
-    const assembledTx = rpc.assembleTransaction(txWithAuth, enforcingSim).build();
-    const bundlerKeypair = Keypair.fromSecret(config.bundlerSecret);
-    assembledTx.sign(bundlerKeypair);
-
-    const sendResult = await server.sendTransaction(assembledTx);
-    if (sendResult.status === "ERROR") {
-      throw new Error(`Submission failed: ${sendResult.errorResult?.toXDR("base64")}`);
-    }
-
-    const txHash = sendResult.hash;
-    let txResult: rpc.Api.GetTransactionResponse | undefined;
-    for (let i = 0; i < 30; i++) {
-      await new Promise((r) => setTimeout(r, 1000));
-      txResult = await server.getTransaction(txHash);
-      if (txResult.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) break;
-    }
-
-    if (txResult?.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-      return NextResponse.json({ hash: txHash, status: "SUCCESS" });
-    }
-
-    throw new Error(`Transaction failed: ${txResult?.status ?? "UNKNOWN"}`);
+    return NextResponse.json({ hash: txHash, status });
   } catch (error) {
     console.error("Error submitting delegated transaction:", error);
     return NextResponse.json(

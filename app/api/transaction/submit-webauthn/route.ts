@@ -6,12 +6,11 @@ import {
   xdr,
   rpc,
   Transaction,
-  Operation,
-  Keypair,
-  Account,
 } from "@stellar/stellar-sdk";
-import { hashSorobanAuthPayload } from "@/lib/soroban-auth-payload";
-import { hash } from "@stellar/stellar-sdk";
+import {
+  rebuildTxWithAuthEntries,
+  submitWithBundler,
+} from "@/lib/soroban-transaction-submit";
 
 /**
  * Submit a transaction with a WebAuthn-signed auth entry.
@@ -58,11 +57,29 @@ export async function POST(request: NextRequest) {
       authEntryXdr,
       sigDataXdr,    // hex string: WebAuthnSigData XDR bytes
       keyDataHex,    // hex string: 65-byte pubkey || credentialId
-      contextRuleId = 0,
+      contextRuleId,
     } = await request.json();
 
-    if (!txXdr || !authEntryXdr || !sigDataXdr || !keyDataHex) {
-      return NextResponse.json({ error: "Missing required parameters." }, { status: 400 });
+    if (
+      !txXdr ||
+      !authEntryXdr ||
+      !sigDataXdr ||
+      !keyDataHex ||
+      contextRuleId === undefined ||
+      contextRuleId === null
+    ) {
+      return NextResponse.json(
+        { error: "Missing required parameters (including contextRuleId)." },
+        { status: 400 }
+      );
+    }
+
+    const ruleId = Number(contextRuleId);
+    if (!Number.isInteger(ruleId) || ruleId < 0) {
+      return NextResponse.json(
+        { error: "contextRuleId must be a non-negative integer" },
+        { status: 400 }
+      );
     }
 
     const tx = TransactionBuilder.fromXDR(txXdr, config.networkPassphrase) as Transaction;
@@ -87,7 +104,7 @@ export async function POST(request: NextRequest) {
     const authPayload = xdr.ScVal.scvMap([
       new xdr.ScMapEntry({
         key: xdr.ScVal.scvSymbol("context_rule_ids"),
-        val: xdr.ScVal.scvVec([xdr.ScVal.scvU32(contextRuleId)]),
+        val: xdr.ScVal.scvVec([xdr.ScVal.scvU32(ruleId)]),
       }),
       new xdr.ScMapEntry({
         key: xdr.ScVal.scvSymbol("signers"),
@@ -103,60 +120,39 @@ export async function POST(request: NextRequest) {
     const credentials = authEntry.credentials().address();
     credentials.signature(authPayload);
 
-    // Rebuild tx with signed auth entry
-    const origOp = tx.operations[0] as Operation.InvokeHostFunction;
-    const sourceAccount = new Account(
-      tx.source,
-      (BigInt(tx.sequence) - BigInt(1)).toString()
-    );
-
-    const txWithAuth = new TransactionBuilder(sourceAccount, {
-      fee: "100000",
-      networkPassphrase: config.networkPassphrase,
-    })
-      .addOperation(
-        Operation.invokeHostFunction({
-          func: origOp.func,
-          auth: [authEntry],
-        })
-      )
-      .setTimeout(300)
-      .build();
-
-    // Enforcing-mode simulation: validates signature on-chain before submission
-    const enforcingSim = await server.simulateTransaction(txWithAuth);
-    if (rpc.Api.isSimulationError(enforcingSim)) {
+    let txWithAuth: Transaction;
+    try {
+      txWithAuth = rebuildTxWithAuthEntries(tx, config.networkPassphrase, [authEntry]);
+    } catch (e) {
       return NextResponse.json(
-        { error: `WebAuthn signature validation failed: ${enforcingSim.error}` },
+        {
+          error:
+            e instanceof Error
+              ? e.message
+              : "Transaction missing Soroban data. Rebuild and submit again.",
+        },
         { status: 400 }
       );
     }
 
-    const assembled = rpc.assembleTransaction(txWithAuth, enforcingSim).build();
-    const bundlerKeypair = Keypair.fromSecret(config.bundlerSecret);
-    assembled.sign(bundlerKeypair);
-
-    const sendResult = await server.sendTransaction(assembled);
-    if (sendResult.status === "ERROR") {
-      throw new Error(
-        `Transaction submission failed: ${sendResult.errorResult?.toXDR("base64")}`
-      );
+    try {
+      const { hash: txHash, status } = await submitWithBundler({
+        server,
+        networkPassphrase: config.networkPassphrase,
+        bundlerSecret: config.bundlerSecret,
+        txWithAuth,
+      });
+      return NextResponse.json({ hash: txHash, status });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("Auth validation failed")) {
+        return NextResponse.json(
+          { error: `WebAuthn signature validation failed: ${msg}` },
+          { status: 400 }
+        );
+      }
+      throw e;
     }
-
-    const txHash = sendResult.hash;
-
-    let txResult: rpc.Api.GetTransactionResponse | undefined;
-    for (let i = 0; i < 30; i++) {
-      await new Promise((r) => setTimeout(r, 1000));
-      txResult = await server.getTransaction(txHash);
-      if (txResult.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) break;
-    }
-
-    if (txResult?.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-      return NextResponse.json({ hash: txHash, status: "SUCCESS" });
-    }
-
-    throw new Error(`Transaction failed: ${txResult?.status ?? "TIMEOUT"}`);
   } catch (error) {
     console.error("WebAuthn submit error:", error);
     return NextResponse.json(

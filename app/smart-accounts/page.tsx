@@ -6,6 +6,7 @@ import {
   WalletType,
   WalletConnectionResult,
 } from "@/lib/wallets";
+import { SendCard } from "@/components/SendCard";
 import {
   signWithPasskey,
   computeAuthDigest,
@@ -306,7 +307,7 @@ export default function SmartAccountsPage() {
         });
         const build = await buildRes.json();
         if (!buildRes.ok) throw new Error(build.error ?? "Build failed.");
-        const { txXdr, authEntryXdr, validUntilLedger } = build;
+        const { txXdr, authEntryXdr, validUntilLedger, contextRuleId } = build;
 
         const authEntry = xdr.SorobanAuthorizationEntry.fromXDR(
           authEntryXdr,
@@ -319,7 +320,7 @@ export default function SmartAccountsPage() {
         const authDigest = computeAuthDigest(
           authEntry,
           NETWORK_PASSPHRASE,
-          [0],
+          [contextRuleId ?? 0],
         );
 
         setTxState("signing");
@@ -339,7 +340,7 @@ export default function SmartAccountsPage() {
             authEntryXdr,
             sigDataXdr: sigDataXdr.toString("hex"),
             keyDataHex: passkeySession.keyDataHex,
-            contextRuleId: 0,
+            contextRuleId: contextRuleId ?? 0,
           }),
         });
         const submitData = await submitRes.json();
@@ -406,7 +407,7 @@ export default function SmartAccountsPage() {
         });
         const build = await buildRes.json();
         if (!buildRes.ok) throw new Error(build.error ?? "Build failed.");
-        const { txXdr, authEntryXdr, authDigestHex } = build;
+        const { txXdr, authEntryXdr, authDigestHex, contextRuleId } = build;
 
         const signPrefixed = async (hashHex: string) => {
           const prefixedMessage = AUTH_PREFIX + hashHex.toLowerCase();
@@ -433,6 +434,7 @@ export default function SmartAccountsPage() {
               authSignatureHex,
               prefixedMessage,
               publicKeyHex: wallet.publicKeyHex,
+              contextRuleId: contextRuleId ?? 0,
             }),
           });
           return { submitRes, submitData: await submitRes.json() };
@@ -849,6 +851,14 @@ export default function SmartAccountsPage() {
                       </div>
                     </div>
                   )}
+
+                  <SendCard
+                    smartAccountAddress={smartAccountAddr}
+                    activeMode={activeMode}
+                    wallet={wallet}
+                    passkeySession={passkeySession}
+                    disabled={isTxBusy}
+                  />
 
                   {/* Counter divider */}
                   <div className="flex items-center gap-3 text-muted-foreground/50">
