@@ -5,18 +5,24 @@
   "scripts": {
     "build": "prisma generate && next build",
     "dev": "next dev",
+    "dev:https": "next dev --experimental-https",
     "lint": "next lint",
     "start": "next start",
     "postinstall": "prisma generate",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "test:sign-demo:unit": "node --test lib/sign-demo/*.test.mjs",
+    "test:sign-demo": "node scripts/test-sign-demo-api.mjs",
+    "test:sign-demo:all": "node --test lib/sign-demo/*.test.mjs && node scripts/test-sign-demo-api.mjs",
+    "test:on-ramp:session": "node scripts/test-on-ramp-session.mjs"
   },
   "dependencies": {
     "@eslint/eslintrc": "latest",
     "@hookform/resolvers": "^3.10.0",
     "@lobstrco/signer-extension-api": "^2.0.0",
+    "@moonpay/platform-sdk-web": "^1.4.2",
     "@phantom/browser-sdk": "^1.0.2",
     "@prisma/client": "^6.19.3",
     "@radix-ui/react-accordion": "1.2.2",
@@ -91,7 +97,13 @@
     "zod": "3.25.67"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["@prisma/client", "@prisma/engines", "prisma", "cbor-extract", "unrs-resolver"]
+    "onlyBuiltDependencies": [
+      "@prisma/client",
+      "@prisma/engines",
+      "prisma",
+      "cbor-extract",
+      "unrs-resolver"
+    ]
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.9",

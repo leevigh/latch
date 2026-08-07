@@ -254,22 +254,68 @@ export function resolveWebauthnCeremonyContext(
   };
 }
 
-export function getRpIdFromRequest(req: Request): string {
-  // Prefer explicit env for local dev behind proxies.
-  const env = process.env.WEBAUTHN_RP_ID;
-  if (env && env.trim()) return env.trim();
+function requestOriginFromHeaders(req: Request): string {
+  try {
+    return new URL(req.url).origin;
+  } catch {
+    const proto = req.headers.get("x-forwarded-proto") || "http";
+    const host = req.headers.get("host") || "localhost";
+    return `${proto}://${host}`;
+  }
+}
 
-  const host = req.headers.get("host") || "localhost";
-  return host.split(":")[0];
+function requestRpIdFromHeaders(req: Request): string {
+  try {
+    return new URL(req.url).hostname;
+  } catch {
+    const host = req.headers.get("host") || "localhost";
+    return host.split(":")[0];
+  }
+}
+
+/**
+ * In dev, use the request Host when env is pinned to localhost but the user opened a LAN / HTTPS URL.
+ */
+function useRequestCeremonyHostInDev(req: Request): boolean {
+  if (process.env.NODE_ENV !== "development") return false;
+  if (process.env.WEBAUTHN_DEV_TRUST_REQUEST_HOST === "1") return true;
+
+  const derivedHost = requestRpIdFromHeaders(req);
+  const envOrigin = process.env.WEBAUTHN_ORIGIN?.trim();
+  if (!envOrigin) return true;
+
+  try {
+    const envHost = new URL(envOrigin).hostname;
+    return (
+      (envHost === "localhost" || envHost === "127.0.0.1") &&
+      derivedHost !== "localhost" &&
+      derivedHost !== "127.0.0.1"
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function getRpIdFromRequest(req: Request): string {
+  if (useRequestCeremonyHostInDev(req)) {
+    return requestRpIdFromHeaders(req);
+  }
+
+  const env = process.env.WEBAUTHN_RP_ID;
+  if (env?.trim()) return env.trim();
+
+  return requestRpIdFromHeaders(req);
 }
 
 export function getExpectedOriginFromRequest(req: Request): string {
-  const env = process.env.WEBAUTHN_ORIGIN;
-  if (env && env.trim()) return env.trim();
+  if (useRequestCeremonyHostInDev(req)) {
+    return requestOriginFromHeaders(req);
+  }
 
-  const proto = req.headers.get("x-forwarded-proto") || "http";
-  const host = req.headers.get("host") || "localhost";
-  return `${proto}://${host}`;
+  const env = process.env.WEBAUTHN_ORIGIN;
+  if (env?.trim()) return env.trim();
+
+  return requestOriginFromHeaders(req);
 }
 
 export function sha256Hex(str: string) {

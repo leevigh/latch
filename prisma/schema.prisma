@@ -24,6 +24,8 @@ model User {
   credentials WebauthnCredential[]
   challenges  WebauthnChallenge[]
   accounts    SmartAccount[]
+  multisigAccounts MultisigAccount[]
+  multisigDrafts   MultisigDraft[]
 
   @@map("users")
 }
@@ -56,6 +58,9 @@ model WebauthnCredential {
   transports String?
   deviceType String? @map("device_type")
   backedUp   Int     @default(0) @map("backed_up")
+
+  /// WebAuthn user.id handle issued at registration begin (not the HTTP session userId).
+  webauthnUserHandle String? @map("webauthn_user_handle")
 
   createdAt BigInt @map("created_at")
 
@@ -94,6 +99,8 @@ model WebauthnChallenge {
   challenge String
   rpId      String  @map("rp_id")
   origin    String
+  /// WebAuthn user.id handle for registration ceremonies (copied onto credential at finish).
+  webauthnUserHandle String? @map("webauthn_user_handle")
   expiresAt BigInt  @map("expires_at")
   createdAt BigInt  @map("created_at")
 
@@ -121,4 +128,171 @@ model AccountSigner {
 
   @@index([smartAccountAddress, signerType], map: "account_signers_addr_type_idx")
   @@map("account_signers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multisig draft (off-chain member collection before deploy)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model MultisigDraft {
+  id                  String  @id @default(cuid())
+  creatorUserId       String  @map("creator_user_id")
+  threshold           Int
+  accountSaltHex      String  @map("account_salt_hex")
+  inviteToken         String  @unique @map("invite_token")
+  status              String  @default("collecting") // collecting | deployed
+  predictedAddress    String? @map("predicted_address")
+  smartAccountAddress String? @map("smart_account_address")
+  createdAt           BigInt  @map("created_at")
+  expiresAt           BigInt? @map("expires_at")
+
+  user    User                 @relation(fields: [creatorUserId], references: [id], onDelete: Cascade)
+  members MultisigDraftMember[]
+
+  @@index([creatorUserId], map: "multisig_drafts_creator_idx")
+  @@map("multisig_drafts")
+}
+
+model MultisigDraftMember {
+  id           String  @id @default(cuid())
+  draftId      String  @map("draft_id")
+  label        String
+  memberType   String  @map("member_type") // webauthn | delegated | ed25519
+  gAddress     String? @map("g_address")
+  keyDataHex   String? @map("key_data_hex")
+  credentialId String? @map("credential_id")
+  publicKeyHex String? @map("public_key_hex")
+  source       String  @default("creator") // creator | invite
+  createdAt    BigInt  @map("created_at")
+
+  draft MultisigDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+
+  @@index([draftId], map: "multisig_draft_members_draft_idx")
+  @@map("multisig_draft_members")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multisig (Safe-style coordination layer)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model MultisigAccount {
+  id                  String @id @default(cuid())
+  userId              String @map("user_id")
+  smartAccountAddress String @unique @map("smart_account_address")
+  threshold           Int    @map("threshold")
+  accountSaltHex      String @map("account_salt_hex")
+  createdAt           BigInt @map("created_at")
+
+  user     User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  members  MultisigMember[]
+  proposals MultisigProposal[]
+
+  @@index([userId], map: "multisig_accounts_user_id_idx")
+  @@map("multisig_accounts")
+}
+
+model MultisigMember {
+  id               String @id @default(cuid())
+  multisigAccountId String @map("multisig_account_id")
+  memberType       String @map("member_type") // 'webauthn' | 'delegated'
+  label            String?
+
+  // For memberType=webauthn
+  keyDataHex       String? @map("key_data_hex")
+  credentialId     String? @map("credential_id")
+
+  // For memberType=delegated
+  gAddress         String? @map("g_address")
+
+  createdAt        BigInt @map("created_at")
+
+  multisigAccount MultisigAccount @relation(fields: [multisigAccountId], references: [id], onDelete: Cascade)
+  approvals       MultisigApproval[]
+
+  @@index([multisigAccountId], map: "multisig_members_acct_idx")
+  @@index([multisigAccountId, memberType], map: "multisig_members_acct_type_idx")
+  @@map("multisig_members")
+}
+
+model MultisigProposal {
+  id                  String @id @default(cuid())
+  multisigAccountId   String @map("multisig_account_id")
+  createdByUserId     String @map("created_by_user_id")
+
+  targetContractId    String @map("target_contract_id")
+  operationKind       String @map("operation_kind") // 'counter_increment' | 'sac_transfer' | ...
+  operationParamsJson String @map("operation_params_json")
+
+  // Built artifacts (everyone signs the same thing)
+  txXdr               String @map("tx_xdr")
+  authEntriesXdrJson  String @map("auth_entries_xdr_json")
+  smartAccountAuthEntryIndex Int @map("smart_account_auth_entry_index")
+  contextRuleId       Int    @map("context_rule_id")
+  authDigestHex       String @map("auth_digest_hex")
+  signaturePayloadHex String @map("signature_payload_hex")
+  validUntilLedger    Int    @map("valid_until_ledger")
+
+  status              String @map("status") // 'pending' | 'executed' | 'expired' | 'cancelled'
+  executedTxHash      String? @map("executed_tx_hash")
+
+  createdAt           BigInt @map("created_at")
+
+  multisigAccount MultisigAccount @relation(fields: [multisigAccountId], references: [id], onDelete: Cascade)
+  approvals       MultisigApproval[]
+
+  @@index([multisigAccountId, status], map: "multisig_proposals_acct_status_idx")
+  @@index([createdByUserId], map: "multisig_proposals_created_by_idx")
+  @@map("multisig_proposals")
+}
+
+model MultisigApproval {
+  id               String @id @default(cuid())
+  proposalId       String @map("proposal_id")
+  memberId         String @map("member_id")
+  approvalType     String @map("approval_type") // 'webauthn' | 'delegated'
+
+  // WebAuthn approval stores sigDataXdr (hex string)
+  webauthnSigDataXdrHex String? @map("webauthn_sig_data_xdr_hex")
+
+  // Delegated approval uses a 2-step flow; store template + signature
+  delegatedEntryTemplateXdr String? @map("delegated_entry_template_xdr")
+  delegatedSignedAuthEntryBase64 String? @map("delegated_signed_auth_entry_base64")
+  delegatedSignerAddress String? @map("delegated_signer_address")
+
+  createdAt        BigInt @map("created_at")
+
+  proposal MultisigProposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  member   MultisigMember   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@unique([proposalId, memberId], map: "multisig_approvals_proposal_member_uniq")
+  @@index([proposalId], map: "multisig_approvals_proposal_idx")
+  @@map("multisig_approvals")
+}
+
+model SignPayload {
+  id         String    @id
+  payload    Json
+  expiresAt  DateTime  @map("expires_at")
+  consumedAt DateTime? @map("consumed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([expiresAt], map: "sign_payloads_expires_at_idx")
+  @@map("sign_payloads")
+}
+
+model OnRampIntent {
+  id                    String   @id
+  memoId                String   @unique @map("memo_id")
+  destinationCAddress   String   @map("destination_c_address")
+  externalCustomerId    String   @map("external_customer_id")
+  moonpayTransactionId  String?  @map("moonpay_transaction_id")
+  status                String   @default("created")
+  fiatAmount            String   @map("fiat_amount")
+  fiatCode              String   @map("fiat_code")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  @@index([status], map: "on_ramp_intents_status_idx")
+  @@index([externalCustomerId], map: "on_ramp_intents_customer_idx")
+  @@map("on_ramp_intents")
 }

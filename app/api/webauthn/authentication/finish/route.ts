@@ -25,7 +25,7 @@ export async function POST(request: Request) {
     const now = nowMs();
 
     const challengeRow = await prisma.webauthnChallenge.findFirst({
-      where: { purpose: "authentication" },
+      where: { userId: sessionUserId, purpose: "authentication" },
       orderBy: { createdAt: "desc" },
       select: { id: true, challenge: true, expiresAt: true, rpId: true, origin: true },
     });

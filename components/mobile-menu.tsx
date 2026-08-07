@@ -62,6 +62,20 @@ export const MobileMenu = ({ className }: MobileMenuProps) => {
                 Smart Accounts
               </Link>
                <Link
+                href="/multisig/wallet"
+                onClick={() => setIsOpen(false)}
+                className="text-xl font-mono uppercase text-foreground/60 transition-colors ease-out duration-150 hover:text-foreground/100 py-2"
+              >
+                Team wallet
+              </Link>
+               <Link
+                href="/dev/counter-dapp"
+                onClick={() => setIsOpen(false)}
+                className="text-xl font-mono uppercase text-foreground/60 transition-colors ease-out duration-150 hover:text-foreground/100 py-2"
+              >
+                Counter dapp
+              </Link>
+               <Link
                 href="https://www.notion.so/Latch-C-Address-Onboarding-Infrastructure-3096bfb65b0f80cca03ef84ed890b599?source=copy_link"
                 target="_blank"
                 onClick={() => setIsOpen(false)}

@@ -31,3 +31,19 @@ PR-Review-Comment.md
 
 # private notes
 docs/_private/
+
+reference/
+reference/freighter
+reference/stellar-dev-skill
+reference/latch-mobile-wallet-backend/
+
+send-token-docs.md
+
+certificates
+
+EXTENSION_IMPLEMENTATION_DIRECTIONS.md
+# EXTERNAL_SIGN_API.md
+LATCH_API_EXTERNAL_SIGN_SPEC.md
+Moonpay-llms-full.txt
+V0_LATCH_STELLAR_SIGN_DEMO_APP_SPEC.md
+LATCH_API_SWAP_ENDPOINTS_SPEC.md

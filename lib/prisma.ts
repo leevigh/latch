@@ -11,12 +11,9 @@ const globalForPrisma = globalThis as unknown as {
 };
 
 function getDatabaseUrlForRuntime(): string | undefined {
-  // In local dev, prefer a direct (non-pooler) connection when available.
-  // Pooler endpoints can be unreachable from some networks and are mainly
-  // intended for serverless runtimes.
-  if (process.env.NODE_ENV !== "production") {
-    return process.env.DIRECT_URL ?? process.env.DATABASE_URL;
-  }
+  // Runtime queries use the pooled DATABASE_URL (PgBouncer). schema.prisma
+  // `directUrl` / DIRECT_URL is for migrations only — the direct Neon host is
+  // often less reliable from local dev (cold starts, firewalls).
   return process.env.DATABASE_URL ?? process.env.DIRECT_URL;
 }
 

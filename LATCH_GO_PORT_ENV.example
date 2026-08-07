@@ -1,0 +1,128 @@
+# Latch Go Backend — Environment Configuration
+# Copy to .env and fill in real values. Never commit secrets.
+#
+# Labels: [REQUIRED] [OPTIONAL] [DEV-ONLY] [SERVER-ONLY] [CLIENT-SAFE]
+#
+# See LATCH_GO_PORT_GUIDE.md §2 for full documentation and startup validation rules.
+
+# =============================================================================
+# DATABASE [REQUIRED for any DB-backed route]
+# =============================================================================
+# Runtime: Neon pooled host (contains "-pooler"). MUST include pgbouncer=true.
+# [REQUIRED] [SERVER-ONLY]
+DATABASE_URL="postgresql://user:PASSWORD@ep-xxxx-pooler.region.aws.neon.tech/neondb?sslmode=require&pgbouncer=true&connection_limit=1"
+
+# Migrations only: direct host WITHOUT "-pooler". Do NOT add pgbouncer=true.
+# [REQUIRED] [SERVER-ONLY]
+DIRECT_URL="postgresql://user:PASSWORD@ep-xxxx.region.aws.neon.tech/neondb?sslmode=require"
+
+# =============================================================================
+# BUNDLER (fee payer) [REQUIRED for all transaction build/submit and deploy routes]
+# =============================================================================
+# Secret G-key that pays Soroban fees. Public G must match extension's
+# PLASMO_PUBLIC_LATCH_FEE_PAYER_G or swaps/sends fail with SIGNER_MISMATCH (409).
+# [REQUIRED] [SERVER-ONLY] — most common silent break when missing
+BUNDLER_SECRET=""
+
+# Optional: older delegated signer if on-chain context rules reference a rotated G.
+# [OPTIONAL] [SERVER-ONLY]
+# LEGACY_DELEGATED_SIGNER_SECRET=""
+
+# =============================================================================
+# SOROBAN NETWORK — TESTNET (default) [REQUIRED]
+# =============================================================================
+# [REQUIRED] [CLIENT-SAFE — extension may read these]
+NEXT_PUBLIC_RPC_URL="https://soroban-testnet.stellar.org"
+NEXT_PUBLIC_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+
+# =============================================================================
+# SOROBAN NETWORK — MAINNET [REQUIRED when network=mainnet in request body]
+# =============================================================================
+# [OPTIONAL until mainnet requests] [SERVER-ONLY]
+# MAINNET_RPC_URL="https://mainnet.sorobanrpc.com"
+# MAINNET_NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015"
+
+# =============================================================================
+# SMART ACCOUNT CONTRACTS [REQUIRED for deploy, submit, setup-rules]
+# =============================================================================
+# [REQUIRED] [CLIENT-SAFE]
+NEXT_PUBLIC_FACTORY_ADDRESS=""
+NEXT_PUBLIC_VERIFIER_ADDRESS=""
+NEXT_PUBLIC_WEBAUTHN_VERIFIER_ADDRESS=""
+
+# Demo counter contract — required for POST /api/transaction/build, build-delegated
+# [OPTIONAL] [CLIENT-SAFE]
+NEXT_PUBLIC_COUNTER_ADDRESS=""
+
+# Legacy smart-account POST route WASM hash
+# [OPTIONAL] [CLIENT-SAFE]
+# NEXT_PUBLIC_SMART_ACCOUNT_WASM_HASH="c00f972cb8ed5eba151f4cd6e97519db679a7a31cc657838449b405fb9cf53c4"
+
+# =============================================================================
+# STELLAR ASSETS (SAC) [REQUIRED for build-send, balances, setup-send-rules]
+# =============================================================================
+# [REQUIRED for send/balance routes] [CLIENT-SAFE]
+NEXT_PUBLIC_NATIVE_SAC_ADDRESS="CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+NEXT_PUBLIC_USDC_SAC_ADDRESS="CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
+
+# Optional JSON catalog: [{ "assetId","symbol","name","contractId","decimals" }, ...]
+# [OPTIONAL] [CLIENT-SAFE]
+# NEXT_PUBLIC_ASSET_ALLOWLIST_JSON=""
+
+# =============================================================================
+# WEBAUTHN CEREMONY [REQUIRED for /api/webauthn/* and multisig draft WebAuthn]
+# =============================================================================
+# Relying party host (no scheme/port). [REQUIRED] [SERVER-ONLY]
+WEBAUTHN_RP_ID="localhost"
+
+# Full origin with scheme. [REQUIRED] [SERVER-ONLY]
+WEBAUTHN_ORIGIN="http://localhost:3000"
+
+# =============================================================================
+# CHROME EXTENSION + CORS [REQUIRED for extension credentials:include fetch]
+# =============================================================================
+# Comma-separated chrome-extension:// IDs (32-char [a-p]).
+# [REQUIRED for extension WebAuthn] [SERVER-ONLY]
+# WEBAUTHN_EXTENSION_IDS="abcdefghijklmnopabcdefghijklmnop"
+
+# Comma-separated exact origins for credentialed CORS on /api/*.
+# [REQUIRED for extension] [SERVER-ONLY]
+# API_CORS_ALLOWED_ORIGINS="http://localhost:3000,chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+
+# =============================================================================
+# DEV-ONLY WEBAUTHN (LAN testing) [OPTIONAL]
+# =============================================================================
+# ALLOWED_DEV_ORIGINS="192.168.1.100"
+# WEBAUTHN_DEV_TRUST_REQUEST_HOST=1
+
+# =============================================================================
+# RUNTIME MODE [OPTIONAL]
+# =============================================================================
+# production → on-ramp routes return 403; build-sign-demo returns 403
+# [OPTIONAL] [SERVER-ONLY]
+NODE_ENV="development"
+
+# Verbose Soroban auth debugging
+# [OPTIONAL] [SERVER-ONLY]
+# DEBUG_SOROBAN_AUTH=1
+
+# =============================================================================
+# MOONPAY ON-RAMP [DEV-ONLY — all /api/on-ramp/* return 403 in production]
+# =============================================================================
+# [DEV-ONLY] [SERVER-ONLY]
+MOONPAY_SECRET_KEY=""
+MOONPAY_PUBLISHABLE_KEY=""
+MOONPAY_INTEGRATION_MODE="auto"
+MOONPAY_API_BASE="https://api.moonpay.com"
+MOONPAY_POOL_G_ADDRESS=""
+MOONPAY_DEFAULT_FIAT_AMOUNT="25"
+MOONPAY_DEFAULT_FIAT_CODE="USD"
+
+# =============================================================================
+# STARTUP VALIDATION CHECKLIST (implement in Go config.Validate())
+# =============================================================================
+# 1. Fail non-zero in production if BUNDLER_SECRET missing
+# 2. Fail if DATABASE_URL missing pgbouncer=true
+# 3. Warn if BUNDLER_SECRET public G != extension fee payer G
+# 4. Log which route groups are disabled when optional env missing
+# 5. Never log or return secret values in API responses

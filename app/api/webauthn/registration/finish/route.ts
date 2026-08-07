@@ -41,7 +41,14 @@ export async function POST(request: Request) {
     const challengeRow = await prisma.webauthnChallenge.findFirst({
       where: { userId, purpose: "registration" },
       orderBy: { createdAt: "desc" },
-      select: { id: true, challenge: true, expiresAt: true, rpId: true, origin: true },
+      select: {
+        id: true,
+        challenge: true,
+        expiresAt: true,
+        rpId: true,
+        origin: true,
+        webauthnUserHandle: true,
+      },
     });
 
     if (!challengeRow || challengeRow.expiresAt <= BigInt(now)) {
@@ -147,6 +154,7 @@ export async function POST(request: Request) {
         transports,
         deviceType: credentialDeviceType,
         backedUp: credentialBackedUp ? 1 : 0,
+        webauthnUserHandle: challengeRow.webauthnUserHandle,
         createdAt: BigInt(now),
       },
       update: {
@@ -158,6 +166,9 @@ export async function POST(request: Request) {
         transports,
         deviceType: credentialDeviceType,
         backedUp: credentialBackedUp ? 1 : 0,
+        ...(challengeRow.webauthnUserHandle
+          ? { webauthnUserHandle: challengeRow.webauthnUserHandle }
+          : {}),
       },
     });
 

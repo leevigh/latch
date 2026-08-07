@@ -78,6 +78,20 @@ export function credentialSwitchName(entry: xdr.SorobanAuthorizationEntry): stri
   }
 }
 
+/** True when address credentials have no signature yet (simulation placeholder). */
+export function isUnsignedAddressAuthEntry(entry: xdr.SorobanAuthorizationEntry): boolean {
+  const creds = entry.credentials();
+  if (creds.switch().name !== "sorobanCredentialsAddress") return false;
+  const sig = creds.address().signature();
+  const sw = sig.switch().name;
+  if (sw === "scvVoid") return true;
+  if (sw === "scvVec") {
+    const vec = sig.vec();
+    return !vec || vec.length === 0;
+  }
+  return false;
+}
+
 /** Contract id string (`C...`) for a Soroban auth entry root, or null. */
 export function rootContractIdString(entry: xdr.SorobanAuthorizationEntry): string | null {
   try {

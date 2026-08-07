@@ -13,6 +13,7 @@ import {
   startAuthentication,
   type RegistrationResponseJSON,
 } from "@simplewebauthn/browser";
+import { assertWebAuthnClientAvailable } from "@/lib/webauthn-client";
 import { hash, xdr, Address } from "@stellar/stellar-sdk";
 import { hashSorobanAuthPayload } from "@/lib/soroban-auth-payload";
 
@@ -55,6 +56,7 @@ export async function registerPasskey(
 ): Promise<PasskeyRegistration> {
   const challenge = generateChallenge();
 
+  assertWebAuthnClientAvailable();
   const response = await startRegistration({
     optionsJSON: {
       challenge,
@@ -106,6 +108,7 @@ export async function signWithPasskey(
   authDigest: Buffer,
   rpId?: string
 ): Promise<PasskeySignature> {
+  assertWebAuthnClientAvailable();
   const response = await startAuthentication({
     optionsJSON: {
       challenge: b64uEncode(authDigest),
@@ -218,6 +221,21 @@ export function buildWebAuthnAuthPayload(
  */
 export function buildKeyData(publicKey: Uint8Array, credentialId: string): Buffer {
   return Buffer.concat([Buffer.from(publicKey), b64uDecode(credentialId)]);
+}
+
+/**
+ * Recover the WebAuthn credential id (base64url) from on-chain key_data hex.
+ * keyData = 65-byte uncompressed P-256 pubkey || credentialId bytes.
+ */
+export function credentialIdFromKeyDataHex(keyDataHex: string): string {
+  const hex = keyDataHex.trim().replace(/^0x/i, "");
+  const buf = Buffer.from(hex, "hex");
+  if (buf.length <= 65 || buf[0] !== 0x04) {
+    throw new Error(
+      "Invalid keyDataHex: expected 65-byte 0x04 pubkey + credential id bytes."
+    );
+  }
+  return b64uEncode(buf.subarray(65));
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────

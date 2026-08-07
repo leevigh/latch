@@ -2,32 +2,44 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   TransactionBuilder,
   Networks,
-  Address,
+  Keypair,
   xdr,
   rpc,
   Transaction,
-  Operation,
-  Keypair,
-  Account,
 } from "@stellar/stellar-sdk";
-import { hashSorobanAuthPayload } from "@/lib/soroban-auth-payload";
-import { hash } from "@stellar/stellar-sdk";
+import { contextRuleIdsForEntry } from "@/lib/soroban-auth-payload";
+import { buildWebAuthnAuthPayload } from "@/lib/webauthn";
+import {
+  signBundlerDelegatedAuthEntry,
+  isBundlerDelegatedCheckAuthEntry,
+} from "@/lib/bundler-delegated-auth";
+import {
+  assembleSignedTxWithBundler,
+  rebuildTxWithAuthEntries,
+  submitWithBundler,
+} from "@/lib/soroban-transaction-submit";
+
+export const maxDuration = 60;
+export const runtime = "nodejs";
 
 /**
  * Submit a transaction with a WebAuthn-signed auth entry.
  *
  * Receives:
  *   txXdr           - base transaction XDR (unsigned envelope)
- *   authEntryXdr    - base64 auth entry with expiration set
+ *   authEntryXdr    - base64 smart-account auth entry with expiration set
  *   sigDataXdr      - hex: WebAuthnSigData XDR bytes from encodeWebAuthnSigData()
  *   keyDataHex      - hex: 65-byte pubkey || credentialId (the signer's key_data)
  *   contextRuleId   - u32: which context rule was used (default: 0)
- *   verifierAddress - the deployed WebAuthn verifier contract address
+ *   authEntriesXdr  - optional full auth entry list (passkey + bundler delegated G)
+ *   smartAccountAuthEntryIndex - index of smart-account row in authEntriesXdr (default 0)
+ *   delegatedGAuthEntrySynthesized - when true, sign bundler delegated entries server-side
  *
  * Flow:
- *   1. Rebuild auth entry with WebAuthn AuthPayload
- *   2. Enforcing-mode simulate (validates signature on-chain)
- *   3. Assemble, fee-payer sign, submit
+ *   1. Rebuild auth entries with WebAuthn AuthPayload on smart-account row
+ *   2. Sign any unsigned bundler delegated __check_auth entries with BUNDLER_SECRET
+ *   3. Enforcing-mode simulate (validates signature on-chain)
+ *   4. Assemble, fee-payer sign, submit
  */
 
 const getConfig = () => ({
@@ -53,110 +65,145 @@ export async function POST(request: NextRequest) {
 
   try {
     const server = new rpc.Server(config.rpcUrl);
+    const body = await request.json();
     const {
       txXdr,
       authEntryXdr,
-      sigDataXdr,    // hex string: WebAuthnSigData XDR bytes
-      keyDataHex,    // hex string: 65-byte pubkey || credentialId
-      contextRuleId = 0,
-    } = await request.json();
+      sigDataXdr,
+      keyDataHex,
+      contextRuleId,
+      authEntriesXdr,
+      smartAccountAuthEntryIndex: smartAccountIdxRaw,
+      delegatedGAuthEntrySynthesized,
+      submit,
+    } = body;
 
-    if (!txXdr || !authEntryXdr || !sigDataXdr || !keyDataHex) {
-      return NextResponse.json({ error: "Missing required parameters." }, { status: 400 });
-    }
-
-    const tx = TransactionBuilder.fromXDR(txXdr, config.networkPassphrase) as Transaction;
-    const authEntry = xdr.SorobanAuthorizationEntry.fromXDR(authEntryXdr, "base64");
-
-    const sigDataBytes = Buffer.from(sigDataXdr, "hex");
-    const keyDataBytes = Buffer.from(keyDataHex, "hex");
-
-    // Build the AuthPayload ScVal:
-    //   AuthPayload {
-    //     context_rule_ids: [contextRuleId],
-    //     signers: { External(verifier, keyData) => sigDataXdr }
-    //   }
-    const signerKey = xdr.ScVal.scvVec([
-      xdr.ScVal.scvSymbol("External"),
-      xdr.ScVal.scvAddress(
-        Address.fromString(config.webauthnVerifierAddress).toScAddress()
-      ),
-      xdr.ScVal.scvBytes(keyDataBytes),
-    ]);
-
-    const authPayload = xdr.ScVal.scvMap([
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol("context_rule_ids"),
-        val: xdr.ScVal.scvVec([xdr.ScVal.scvU32(contextRuleId)]),
-      }),
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol("signers"),
-        val: xdr.ScVal.scvMap([
-          new xdr.ScMapEntry({
-            key: signerKey,
-            val: xdr.ScVal.scvBytes(sigDataBytes),
-          }),
-        ]),
-      }),
-    ]);
-
-    const credentials = authEntry.credentials().address();
-    credentials.signature(authPayload);
-
-    // Rebuild tx with signed auth entry
-    const origOp = tx.operations[0] as Operation.InvokeHostFunction;
-    const sourceAccount = new Account(
-      tx.source,
-      (BigInt(tx.sequence) - BigInt(1)).toString()
-    );
-
-    const txWithAuth = new TransactionBuilder(sourceAccount, {
-      fee: "100000",
-      networkPassphrase: config.networkPassphrase,
-    })
-      .addOperation(
-        Operation.invokeHostFunction({
-          func: origOp.func,
-          auth: [authEntry],
-        })
-      )
-      .setTimeout(300)
-      .build();
-
-    // Enforcing-mode simulation: validates signature on-chain before submission
-    const enforcingSim = await server.simulateTransaction(txWithAuth);
-    if (rpc.Api.isSimulationError(enforcingSim)) {
+    if (
+      !txXdr ||
+      !authEntryXdr ||
+      !sigDataXdr ||
+      !keyDataHex ||
+      contextRuleId === undefined ||
+      contextRuleId === null
+    ) {
       return NextResponse.json(
-        { error: `WebAuthn signature validation failed: ${enforcingSim.error}` },
+        { error: "Missing required parameters (including contextRuleId)." },
         { status: 400 }
       );
     }
 
-    const assembled = rpc.assembleTransaction(txWithAuth, enforcingSim).build();
-    const bundlerKeypair = Keypair.fromSecret(config.bundlerSecret);
-    assembled.sign(bundlerKeypair);
-
-    const sendResult = await server.sendTransaction(assembled);
-    if (sendResult.status === "ERROR") {
-      throw new Error(
-        `Transaction submission failed: ${sendResult.errorResult?.toXDR("base64")}`
+    const ruleId = Number(contextRuleId);
+    if (!Number.isInteger(ruleId) || ruleId < 0) {
+      return NextResponse.json(
+        { error: "contextRuleId must be a non-negative integer" },
+        { status: 400 }
       );
     }
 
-    const txHash = sendResult.hash;
-
-    let txResult: rpc.Api.GetTransactionResponse | undefined;
-    for (let i = 0; i < 30; i++) {
-      await new Promise((r) => setTimeout(r, 1000));
-      txResult = await server.getTransaction(txHash);
-      if (txResult.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) break;
+    const smartAccountAuthEntryIndex =
+      smartAccountIdxRaw !== undefined && smartAccountIdxRaw !== null
+        ? Number(smartAccountIdxRaw)
+        : 0;
+    if (!Number.isInteger(smartAccountAuthEntryIndex) || smartAccountAuthEntryIndex < 0) {
+      return NextResponse.json(
+        { error: "smartAccountAuthEntryIndex must be a non-negative integer" },
+        { status: 400 }
+      );
     }
 
-    if (txResult?.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-      return NextResponse.json({ hash: txHash, status: "SUCCESS" });
+    const tx = TransactionBuilder.fromXDR(txXdr, config.networkPassphrase) as Transaction;
+
+    const entries: xdr.SorobanAuthorizationEntry[] =
+      Array.isArray(authEntriesXdr) && authEntriesXdr.length > 0
+        ? authEntriesXdr.map((xdrB64: string) =>
+            xdr.SorobanAuthorizationEntry.fromXDR(xdrB64, "base64")
+          )
+        : [xdr.SorobanAuthorizationEntry.fromXDR(authEntryXdr, "base64")];
+
+    if (smartAccountAuthEntryIndex >= entries.length) {
+      return NextResponse.json(
+        { error: "smartAccountAuthEntryIndex is out of range for authEntriesXdr." },
+        { status: 400 }
+      );
     }
 
-    throw new Error(`Transaction failed: ${txResult?.status ?? "TIMEOUT"}`);
+    const sigDataBytes = Buffer.from(sigDataXdr, "hex");
+    const keyDataBytes = Buffer.from(keyDataHex, "hex");
+
+    const smartAccountEntry = entries[smartAccountAuthEntryIndex];
+    const contextRuleIds = contextRuleIdsForEntry(smartAccountEntry, ruleId);
+    const authPayload = buildWebAuthnAuthPayload(
+      config.webauthnVerifierAddress,
+      keyDataBytes,
+      sigDataBytes,
+      contextRuleIds
+    );
+    smartAccountEntry.credentials().address().signature(authPayload);
+    entries[smartAccountAuthEntryIndex] = smartAccountEntry;
+
+    const bundlerKeypair = Keypair.fromSecret(config.bundlerSecret);
+    const bundlerPublicKey = bundlerKeypair.publicKey();
+
+    const shouldSignBundler =
+      delegatedGAuthEntrySynthesized === true ||
+      entries.some((e) => isBundlerDelegatedCheckAuthEntry(e, bundlerPublicKey));
+
+    if (shouldSignBundler) {
+      for (let i = 0; i < entries.length; i++) {
+        if (i === smartAccountAuthEntryIndex) continue;
+        if (isBundlerDelegatedCheckAuthEntry(entries[i], bundlerPublicKey)) {
+          entries[i] = signBundlerDelegatedAuthEntry(
+            entries[i],
+            bundlerKeypair,
+            config.networkPassphrase
+          );
+        }
+      }
+    }
+
+    let txWithAuth: Transaction;
+    try {
+      txWithAuth = rebuildTxWithAuthEntries(tx, config.networkPassphrase, entries);
+    } catch (e) {
+      return NextResponse.json(
+        {
+          error:
+            e instanceof Error
+              ? e.message
+              : "Transaction missing Soroban data. Rebuild and submit again.",
+        },
+        { status: 400 }
+      );
+    }
+
+    try {
+      // submit === false: sign + assemble, return signed tx XDR for dApp RPC submit.
+      if (submit === false) {
+        const { signedTxXdr } = await assembleSignedTxWithBundler({
+          server,
+          networkPassphrase: config.networkPassphrase,
+          bundlerSecret: config.bundlerSecret,
+          txWithAuth,
+        });
+        return NextResponse.json({ signedTxXdr, submitted: false });
+      }
+      const { hash: txHash, status } = await submitWithBundler({
+        server,
+        networkPassphrase: config.networkPassphrase,
+        bundlerSecret: config.bundlerSecret,
+        txWithAuth,
+      });
+      return NextResponse.json({ hash: txHash, status });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("Auth validation failed")) {
+        return NextResponse.json(
+          { error: `WebAuthn signature validation failed: ${msg}` },
+          { status: 400 }
+        );
+      }
+      throw e;
+    }
   } catch (error) {
     console.error("WebAuthn submit error:", error);
     return NextResponse.json(
